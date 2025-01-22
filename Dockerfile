@@ -1,6 +1,6 @@
 FROM debian:bookworm-slim AS base
 
-ARG BUILD_VERSION="demo"
+ARG BUILD_VERSION="OSPI"
 
 ########################################
 ## 1st stage compiles OpenSprinkler code
