@@ -26,3 +26,4 @@ clean:
 .PHONY: container
 container:
         docker build .
+v
