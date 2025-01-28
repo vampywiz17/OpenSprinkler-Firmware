@@ -557,8 +557,7 @@ void checkLogSwitch(uint8_t log) {
 
 void checkLogSwitchAfterWrite(uint8_t log) {
   ulong size = file_size(getlogfile(log));
-  if ((size / SENSORLOG_STORE_SIZE) >=
-      MAX_LOG_SIZE) {  // switch logs if max reached
+  if ((size / SENSORLOG_STORE_SIZE) >= MAX_LOG_SIZE) {  // switch logs if max reached
     if (logFileSwitch[log] == 1)
       logFileSwitch[log] = 2;
     else
@@ -588,19 +587,25 @@ bool sensorlog_add(uint8_t log, SensorLog_t *sensorlog) {
 bool sensorlog_add(uint8_t log, Sensor_t *sensor, ulong time) {
 
   if (sensor->flags.data_ok && sensor->flags.log && time > 1000) {
-    SensorLog_t sensorlog;
-    memset(&sensorlog, 0, sizeof(SensorLog_t));
-    sensorlog.nr = sensor->nr;
-    sensorlog.time = time;
-    sensorlog.native_data = sensor->last_native_data;
-    sensorlog.data = sensor->last_data;
 
     if (log == LOG_STD)
       add_influx_data(sensor);
 
-    if (!sensorlog_add(log, &sensorlog)) {
-      sensor->flags.log = 0;
-      return false;
+    // Write to log file only if necessary
+    if (time-sensor->last_logged_time > 86400 || abs(sensor->last_data - sensor->last_logged_data) > 0.00999) {
+      SensorLog_t sensorlog;
+      memset(&sensorlog, 0, sizeof(SensorLog_t));
+      sensorlog.nr = sensor->nr;
+      sensorlog.time = time;
+      sensorlog.native_data = sensor->last_native_data;
+      sensorlog.data = sensor->last_data;
+      sensor->last_logged_data = sensor->last_data;
+      sensor->last_logged_time = time;
+
+      if (!sensorlog_add(log, &sensorlog)) {
+        sensor->flags.log = 0;
+        return false;
+      }
     }
     return true;
   }
@@ -2988,6 +2993,15 @@ void check_monitors() {
             mon->active = mon->m.sensor12.invers? !os.status.sensor2_active : os.status.sensor2_active;
         break;
 
+      case MONITOR_SET_SENSOR12:
+        mon->active = get_monitor(mon->m.set_sensor12.monitor, false, false);
+        if (mon->m.set_sensor12.sensor12 == 1) {
+          os.status.forced_sensor1 = mon->active;
+        }
+        if (mon->m.set_sensor12.sensor12 == 2) {
+          os.status.forced_sensor2 = mon->active;
+        }
+        break;
       case MONITOR_AND:
         mon->active = get_monitor(mon->m.andorxor.monitor1, mon->m.andorxor.invers1, true) &&
           get_monitor(mon->m.andorxor.monitor2, mon->m.andorxor.invers2, true) &&
