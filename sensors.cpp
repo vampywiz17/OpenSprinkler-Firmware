@@ -80,9 +80,8 @@ static modbus_t * ttyDevices[MAX_RS485_DEVICES];
 #endif
 
 const char *sensor_unitNames[]{
-    "",   "%",   "°C",  "°F", "V", "%", "in",
-    "mm", "mph", "kmh", "%",  "DK"
-    //   0   1     2     3    4    5     6      7      8      9   10,  11
+    "",  "%", "°C", "°F", "V", "%", "in", "mm", "mph", "kmh", "%", "DK", "LM", "LX"
+    //0   1     2     3    4    5    6     7      8      9     10,  11,   12,   13
     //   0=Nothing
     //   1=Soil moisture
     //   2=degree celsius temperature
@@ -94,7 +93,9 @@ const char *sensor_unitNames[]{
     //   8=Wind mph
     //   9=Wind kmh
     //  10=Level %
-    //  11=DK
+    //  11=DK (Permitivität)
+    //  12=LM (Lumen)
+    //  13=LX (LUX)
 };
 uint8_t logFileSwitch[3] = {0, 0, 0};  // 0=use smaller File, 1=LOG1, 2=LOG2
 
@@ -1353,14 +1354,13 @@ int read_sensor_rs485(Sensor_t *sensor) {
   bool isTemp = sensor->type == SENSOR_SMT100_TEMP || sensor->type == SENSOR_TH100_TEMP;
   bool isMois = sensor->type == SENSOR_SMT100_MOIS || sensor->type == SENSOR_TH100_MOIS;
   uint8_t type = isTemp ? 0x00 : isMois ? 0x01 : 0x02;
-  
+
   uint16_t tab_reg[3] = {0};
   modbus_set_slave(ttyDevices[device], sensor->id);
   if (modbus_read_registers(ttyDevices[device], type, 2, tab_reg) > 0) {
     uint16_t data = tab_reg[0];
     DEBUG_PRINTF("read_sensor_rs485: result: %d - %d\n", sensor->id, data);
-    double value =
-        sensor->type == isTemp ? (data / 100.0) - 100.0 : (isMois ? data / 100.0 : data);
+    double value = isTemp ? (data / 100.0) - 100.0 : (isMois ? data / 100.0 : data);
     sensor->last_native_data = data;
     sensor->last_data = value;
     DEBUG_PRINTLN(sensor->last_data);
@@ -2848,6 +2848,13 @@ void start_monitor_action(Monitor_t * mon) {
 
   if (mon->zone > 0) {
     uint sid = mon->zone-1;
+
+		// schedule manual station
+		// skip if the station is a master station
+		// (because master cannot be scheduled independently)
+		if ((os.status.mas==sid+1) || (os.status.mas2==sid+1))
+			return;
+
     uint16_t timer=mon->maxRuntime;
     RuntimeQueueStruct *q = NULL;
 		unsigned char sqi = pd.station_qid[sid];
