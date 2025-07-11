@@ -86,10 +86,10 @@ typedef unsigned long ulong;
 
 /** HTTP request macro defines */
 #define HTTP_RQT_SUCCESS       0
-#define HTTP_RQT_NOT_RECEIVED  1
-#define HTTP_RQT_CONNECT_ERR   2
-#define HTTP_RQT_TIMEOUT       3
-#define HTTP_RQT_EMPTY_RETURN  4
+#define HTTP_RQT_NOT_RECEIVED  -1
+#define HTTP_RQT_CONNECT_ERR   -2
+#define HTTP_RQT_TIMEOUT       -3
+#define HTTP_RQT_EMPTY_RETURN  -4
 
 /** Sensor macro defines */
 #define SENSOR_TYPE_NONE    0x00
@@ -99,7 +99,7 @@ typedef unsigned long ulong;
 #define SENSOR_TYPE_PSWITCH 0xF0  // program switch sensor
 #define SENSOR_TYPE_OTHER   0xFF
 
-#define FLOWCOUNT_RT_WINDOW   30  // flow count window (for computing real-time flow rate), 30 seconds
+#define FLOWCOUNT_RT_WINDOW   1000  // flow count divisor (for computing real-time flow rate)
 
 /** Reboot cause */
 #define REBOOT_CAUSE_NONE   0
@@ -263,7 +263,7 @@ enum {
 	IOPT_FORCE_WIRED,
 	IOPT_LATCH_ON_VOLTAGE,
 	IOPT_LATCH_OFF_VOLTAGE,
-	IOPT_NOTIF2_ENABLE, // Notification part 2
+	IOPT_NOTIF2_ENABLE,
 	IOPT_RESERVE_4,
 	IOPT_RESERVE_5,
 	IOPT_RESERVE_6,
@@ -364,7 +364,6 @@ enum {
 	#define EXP_I2CADDR_BASE 0x24 // base of expander I2C address
 	#define LCD_I2CADDR      0x3C // 128x64 OLED display I2C address
 	#define EEPROM_I2CADDR   0x50 // 24C02 EEPROM I2C address
-	#define EEPROM_I2CADDR   0x50 // 24C02 EEPROM I2C address
 
 	#define PIN_CURR_SENSE    A0    // current sensing pin
 	#define PIN_LATCH_VOLT_SENSE A0 // latch voltage sensing pin
@@ -373,6 +372,7 @@ enum {
 	#define ETHER_BUFFER_SIZE_L   ETHER_BUFFER_SIZE+100
 
 	#define PIN_ETHER_CS       16 // Ethernet CS (chip select pin) is 16 on OS 3.2 and above
+	#define ETHER_SPI_CLOCK    10000000L // SPI clock for Ethernet (e.g. 10MHz)
 
 	/* To accommodate different OS30 versions, we use software defines pins */
 	extern unsigned char PIN_BUTTON_1;
@@ -504,7 +504,12 @@ enum {
 
 #else
 
+	#if defined(ARDUINO)
+	// work-around for PIN_SENSOR1 on OS3.2 and above
+	#define DEBUG_BEGIN(x)   {Serial.begin(115200); Serial.end();}
+	#else
 	#define DEBUG_BEGIN(x)   {}
+	#endif
 	#define DEBUG_PRINT(x)   {}
 	#define DEBUG_PRINTLN(x) {}
 	#define DEBUG_PRINTF(x, ...)  {}

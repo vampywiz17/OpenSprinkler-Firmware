@@ -257,6 +257,7 @@ public:
 #endif
 
 	static OSMqtt mqtt;
+
 	static NVConData nvdata;
 	static ConStatus status;
 	static ConStatus old_status;
@@ -280,6 +281,7 @@ public:
 	static uint16_t attrib_fas[MAX_NUM_STATIONS]; //value*100 flow alert setpoint
 	static uint16_t attrib_favg[MAX_NUM_STATIONS]; //value*100 flow avg values
 	static unsigned char masters[NUM_MASTER_ZONES][NUM_MASTER_OPTS];
+	static time_os_t masters_last_on[NUM_MASTER_ZONES];
 
 	// variables for time keeping
 	static time_os_t sensor1_on_timer;  // time when sensor1 is detected on last time

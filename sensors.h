@@ -37,6 +37,7 @@ extern "C" {
 #endif
 #include "defines.h"
 #include "utils.h"
+#include "notifier.h"
 #if defined(ESP8266)
 #include <ADS1X15.h>
 #endif
@@ -350,7 +351,9 @@ unsigned char getSensorUnitId(Sensor_t *sensor);
 
 extern char ether_buffer[];
 extern char tmp_buffer[];
+extern OpenSprinkler os;
 extern ProgramData pd;
+extern NotifQueue notif;
 
 // Utils:
 uint16_t CRC16(unsigned char buf[], int len);

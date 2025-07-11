@@ -212,23 +212,12 @@ void rewind_ether_buffer() {
 	ether_buffer[0] = 0;
 }
 
-#if defined(USE_OTF)
-boolean buffer_available() {
-	return bfill.position() < RESPONSE_BUFFER_SIZE/2 && available_ether_buffer() > 0;
-}
-#else
-boolean buffer_available() {
-	return available_ether_buffer() > 0;
-}
-#endif
-
 void send_packet(OTF_PARAMS_DEF) {
 #if defined(USE_OTF)
 	res.writeBodyData(ether_buffer, strlen(ether_buffer));
 #else
 	m_client->write((const uint8_t *)ether_buffer, strlen(ether_buffer));
 #endif
-
 	rewind_ether_buffer();
 }
 
@@ -301,7 +290,6 @@ void otf_send_result(OTF_PARAMS_DEF, unsigned char code, const char *item = NULL
 	print_header(OTF_PARAMS, true, json.length());
 	res.writeBodyChunk((char *)"%s",json.c_str());
 }
-#endif
 
 #if defined(ESP8266)
 void update_server_send_result(unsigned char code, const char* item = NULL) {
@@ -398,6 +386,8 @@ void on_ap_try_connect(OTF_PARAMS_DEF) {
 	}
 }
 #endif
+#endif
+
 
 /** Check and verify password */
 #if defined(USE_OTF)
@@ -499,7 +489,7 @@ void server_json_stations_main(OTF_PARAMS_DEF) {
 		bfill.emit_p(PSTR("\"$S\""), tmp_buffer);
 		if(sid!=os.nstations-1)
 			bfill.emit_p(PSTR(","));
-		if (!buffer_available() ) {
+		if (available_ether_buffer() <=0 ) {
 			send_packet(OTF_PARAMS);
 		}
 	}
@@ -544,7 +534,7 @@ void server_json_station_special(OTF_PARAMS_DEF) {
 			else {comma=1;}
 			bfill.emit_p(PSTR("\"$D\":{\"st\":$D,\"sd\":\"$S\"}"), sid, data->type, data->sped);
 		}
-		if (!buffer_available() ) {
+		if (available_ether_buffer() <=0 ) {
 			send_packet(OTF_PARAMS);
 		}
 	}
@@ -830,7 +820,7 @@ void server_change_runonce(OTF_PARAMS_DEF) {
 			prog.days[0] = (epoch_t >> 8) & 0b11111111; //one interval past current day in epoch time
 			prog.days[1] = epoch_t & 0b11111111; //one interval past current day in epoch time
 			prog.starttimes[0] = curr_time % 1440; //one interval past current time
-			strcpy_P(prog.name, "Run Once (Repeat)"); //TODO: Change name
+			strcpy_P(prog.name, PSTR("Run-Once with repeat"));
 
 			//if no more repeats, remove interval to flag for deletion
 			if(prog.starttimes[1] == 0){
@@ -848,6 +838,11 @@ void server_change_runonce(OTF_PARAMS_DEF) {
 	boolean match_found = false;
 	for(sid=0;sid<os.nstations;sid++) {
 		dur=prog.durations[sid];
+		if(findKeyVal(FKV_SOURCE,tmp_buffer,TMP_BUFFER_SIZE,PSTR("uwt"),true)){
+			if((uint16_t)atol(tmp_buffer)){
+				dur = dur * os.iopts[IOPT_WATER_PERCENTAGE] / 100;
+			}
+		}
 		bid=sid>>3;
 		s=sid&0x07;
 		// if non-zero duration is given
@@ -1122,8 +1117,8 @@ void server_json_options_main() {
 		}
 		#endif
 #else
-		// for Linux-based platforms, there is no LCD currently
-		if(oid==IOPT_LCD_CONTRAST || oid==IOPT_LCD_BACKLIGHT || oid==IOPT_LCD_DIMMING) continue;
+		// for Linux-based platforms, we can't adjust contrast or backlight
+		if(oid==IOPT_LCD_CONTRAST || oid==IOPT_LCD_BACKLIGHT) continue;
 #endif
 
 		// each json name takes 5 characters
@@ -1195,7 +1190,7 @@ void server_json_programs_main(OTF_PARAMS_DEF) {
 		}
 		// push out a packet if available
 		// buffer size is getting small
-		if (!buffer_available()) {
+		if (available_ether_buffer() <= 0) {
 			send_packet(OTF_PARAMS);
 		}
 	}
@@ -1330,7 +1325,7 @@ void server_json_controller_main(OTF_PARAMS_DEF) {
 	for(sid=0;sid<os.nstations;sid++) {
 		// if available ether buffer is getting small
 		// send out a packet
-		if(!buffer_available()) {
+		if(available_ether_buffer() <= 0) {
 			send_packet(OTF_PARAMS);
 		}
 		unsigned long rem = 0;
@@ -1358,7 +1353,7 @@ void server_json_controller_main(OTF_PARAMS_DEF) {
 	bfill.emit_p(PSTR("]"));
 
 	//influxdb
-	if(!buffer_available()) {
+	if (available_ether_buffer() <=0 ) {
 		send_packet(OTF_PARAMS);
 	}
 	bfill.emit_p(PSTR(",\"influxdb\":"));
@@ -1588,10 +1583,6 @@ void server_change_options(OTF_PARAMS_DEF)
 			} // encode station delay time
 			if(oid==IOPT_BOOST_TIME) {
 				 v>>=2;
-			}
-			if (oid==IOPT_NOTIF_ENABLE) {
-				set_notif_enabled(v);
-				continue;
 			}
 
 			if (v>=0 && v<=max_value) {
@@ -1846,12 +1837,12 @@ void server_change_manual(OTF_PARAMS_DEF) {
 			RuntimeQueueStruct *q = NULL;
 			unsigned char sqi = pd.station_qid[sid];
 			// check if the station already has a schedule
-			if (sqi!=0xFF) {  // if so, we will overwrite the schedule
-				q = pd.queue+sqi;
+			if (sqi!=0xFF) { // if so, do nothing
+
 			} else {  // otherwise create a new queue element
 				q = pd.enqueue();
 			}
-			// if the queue is not full
+			// if the queue is not full (and the station doesn't already have a schedule
 			if (q) {
 				q->st = 0;
 				q->dur = timer;
@@ -2019,7 +2010,7 @@ void server_json_log(OTF_PARAMS_DEF) {
 			bfill.emit_p(PSTR("$S"), tmp_buffer);
 			// if the available ether buffer size is getting small
 			// push out a packet
-			if (!buffer_available()) {
+			if (available_ether_buffer() <= 0) {
 				send_packet(OTF_PARAMS);
 			}
 		}
@@ -2148,14 +2139,13 @@ void server_json_debug(OTF_PARAMS_DEF) {
 	(unsigned long)ESP.getFreeHeap());
 	FSInfo fs_info;
 	LittleFS.info(fs_info);
-	bfill.emit_p(PSTR(",\"flash\":$D,\"used\":$D,"), fs_info.totalBytes, fs_info.usedBytes);
+	bfill.emit_p(PSTR(",\"flash\":$D,\"used\":$D,\"devip\":\"$S\","), fs_info.totalBytes, fs_info.usedBytes, (useEth?eth.localIP():WiFi.localIP()).toString().c_str());
 	if(useEth) {
-		bfill.emit_p(PSTR("\"isW5500\":$D}"), eth.isW5500);
+		bfill.emit_p(PSTR("\"isW5500\":$D,\"spi_clock\":$L,\"arp_size\":$D}"), eth.isW5500, ETHER_SPI_CLOCK, ARP_TABLE_SIZE);
 	} else {
 		bfill.emit_p(PSTR("\"rssi\":$D,\"bssid\":\"$S\",\"bssidchl\":\"$O\"}"),
 		WiFi.RSSI(), WiFi.BSSIDstr().c_str(), SOPT_STA_BSSID_CHL);
 	}
-
 /*
 // print out all log files and all files in the main folder with file sizes
 	DEBUG_PRINTLN(F("List Files:"));
@@ -2862,7 +2852,7 @@ void server_sensorlog_list(OTF_PARAMS_DEF) {
 			}
 			// if available ether buffer is getting small
 			// send out a packet
-			if (!buffer_available() ) {
+			if (available_ether_buffer() <=0 ) {
 				send_packet(OTF_PARAMS);
 			}
 			if (++count >= maxResults) {
@@ -4106,7 +4096,9 @@ void on_sta_update(OTF_PARAMS_DEF) {
 }
 
 void on_sta_upload_fin() {
-	if(!(update_server->hasArg("pw") && os.password_verify(update_server->arg("pw").c_str()))) {
+	if (os.iopts[IOPT_IGNORE_PASSWORD]) {
+		// don't check password
+	} else if(!(update_server->hasArg("pw") && os.password_verify(update_server->arg("pw").c_str()))) {
 		update_server_send_result(HTML_UNAUTHORIZED);
 		Update.end(false);
 		return;

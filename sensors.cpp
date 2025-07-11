@@ -41,6 +41,7 @@
 #include "utils.h"
 #include "weather.h"
 #include "osinfluxdb.h"
+#include "notifier.h"
 #ifdef ADS1115
 #include "sensor_ospi_ads1115.h"
 #endif
@@ -2853,7 +2854,6 @@ Monitor_t *monitor_by_idx(uint idx) {
 void manual_start_program(unsigned char, unsigned char);
 void schedule_all_stations(time_os_t curr_time);
 void turn_off_station(unsigned char sid, time_os_t curr_time, unsigned char shift=0);
-void push_message(uint16_t type, uint32_t lval=0, float fval=0.f, const char* sval=NULL);
 
 void start_monitor_action(Monitor_t * mon) {
   mon->time = os.now_tz();
@@ -2901,7 +2901,7 @@ void stop_monitor_action(Monitor_t * mon) {
   }
 }
 
-void push_message(Monitor_t * mon, float value) {
+void push_message(Monitor_t * mon, float value, byte monidx) {
   uint16_t type; 
   switch(mon->prio) {
     case 0: type = NOTIFY_MONITOR_LOW; break;
@@ -2915,7 +2915,7 @@ void push_message(Monitor_t * mon, float value) {
   DEBUG_PRINT(name);
   DEBUG_PRINT(" - ");
   DEBUG_PRINTLN(type);
-  push_message(type, (uint32_t)mon->prio, value, name);
+  notif.add(type, (uint32_t)mon->prio, value, monidx);
 }
 
 bool get_monitor(uint nr, bool inv, bool defaultBool) {
@@ -2978,6 +2978,7 @@ bool get_remote_monitor(Monitor_t *mon, bool defaultBool) {
 
 void check_monitors() {
   Monitor_t *mon = monitors;
+  int monidx = 0;
   while (mon) {
     uint nr = mon->nr;
 
@@ -3069,7 +3070,7 @@ void check_monitors() {
     if (mon->active != wasActive) {
       if (mon->active) {
         start_monitor_action(mon);
-        push_message(mon, value);
+        push_message(mon, value, monidx);
         mon = monitor_by_nr(nr); //restart because if send by mail we unloaded+reloaded the monitors
       } else {
         stop_monitor_action(mon);
@@ -3077,5 +3078,6 @@ void check_monitors() {
     }
 
     mon = mon->next;
+    monidx++;
   }
 }
