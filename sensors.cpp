@@ -2901,7 +2901,7 @@ void stop_monitor_action(Monitor_t * mon) {
   }
 }
 
-void push_message(Monitor_t * mon, float value, byte monidx) {
+void push_message(Monitor_t * mon, float value, int monidx) {
   uint16_t type; 
   switch(mon->prio) {
     case 0: type = NOTIFY_MONITOR_LOW; break;
@@ -2915,7 +2915,7 @@ void push_message(Monitor_t * mon, float value, byte monidx) {
   DEBUG_PRINT(name);
   DEBUG_PRINT(" - ");
   DEBUG_PRINTLN(type);
-  notif.add(type, (uint32_t)mon->prio, value, (byte)monidx);
+  notif.add(type, (uint32_t)mon->prio, value, (uint8_t)monidx);
 }
 
 bool get_monitor(uint nr, bool inv, bool defaultBool) {
