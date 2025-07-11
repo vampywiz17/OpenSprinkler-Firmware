@@ -2915,7 +2915,7 @@ void push_message(Monitor_t * mon, float value, byte monidx) {
   DEBUG_PRINT(name);
   DEBUG_PRINT(" - ");
   DEBUG_PRINTLN(type);
-  notif.add(type, (uint32_t)mon->prio, value, monidx);
+  notif.add(type, (uint32_t)mon->prio, value, (byte)monidx);
 }
 
 bool get_monitor(uint nr, bool inv, bool defaultBool) {
