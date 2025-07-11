@@ -230,7 +230,7 @@ void push_message(uint16_t type, uint32_t lval, float fval, uint8_t bval) {
 				if(email_enabled) { email_message.subject += PSTR("station event"); }
 			}			break;
 
-		case NOTIFY_STATION_OFF:
+		case NOTIFY_STATION_OFF: {
 
 			if (os.mqtt.enabled()) {
 				snprintf_P(topic, PUSH_TOPIC_LEN, PSTR("station/%d"), lval);
@@ -267,7 +267,17 @@ void push_message(uint16_t type, uint32_t lval, float fval, uint8_t bval) {
 				}
 				if(email_enabled) { email_message.subject += PSTR("station event"); }
 			}
+
+			//calculate flow average:
+			uint16_t avg_flow = flow_last_gpm * flowrate100;
+			if (os.get_flow_avg_value(lval) == 0) {
+				os.set_flow_avg_value(lval, avg_flow);
+			} else {
+				os.set_flow_avg_value(lval, (os.get_flow_avg_value(lval) + avg_flow) / 2);
+			}
+
 			break;
+		}
 
 		case NOTIFY_FLOW_ALERT:{
 			//First determine if a Flow Alert should be sent based on flow amount and setpoint
@@ -277,6 +287,13 @@ void push_message(uint16_t type, uint32_t lval, float fval, uint8_t bval) {
 
 			//Added variable for flow_gpm_alert_setpoint and set default value to max
 			float flow_gpm_alert_setpoint = 999.9f;
+			
+			//Added variable for flow_gpm_alert_setpoint 
+			uint16_t fasp = os.get_flow_alert_setpoint(lval);
+			if (fasp > 0) {
+				flow_alert_flag = true;
+				flow_gpm_alert_setpoint = (float)(fasp) / 100.0f; 
+			}
 
 			//Added variable for tmp station name
 			char tmp_station_name[STATION_NAME_SIZE];
@@ -285,7 +302,7 @@ void push_message(uint16_t type, uint32_t lval, float fval, uint8_t bval) {
 			os.get_station_name(lval, tmp_station_name);
 
 			// only proceed if flow rate is positive, and the station name has at least 5 characters
-			if (flow_last_gpm > 0 && strlen(tmp_station_name) > 5) {
+			if (!flow_alert_flag && flow_last_gpm > 0 && strlen(tmp_station_name) > 5) {
 				const char *station_name_last_five_chars = tmp_station_name;
 				// extract the last 5 characters
 				station_name_last_five_chars = tmp_station_name + strlen(tmp_station_name) - 5;
@@ -295,22 +312,16 @@ void push_message(uint16_t type, uint32_t lval, float fval, uint8_t bval) {
 				flow_gpm_alert_setpoint = strtod(station_name_last_five_chars, &endptr);
 				if (endptr != station_name_last_five_chars) {
 					//station_name_last_five_chars was successfully converted to a number 
-					//flow_last_gpm is actually collected and stored as pulses per minute, not gallons per minute
-					// Alert Check - Compare flow_gpm_alert_setpoint with flow_last_gpm and enable flow_alert_flag if flow is above setpoint
-					if ((flow_last_gpm*flowrate100/100.f) > flow_gpm_alert_setpoint) {
-						flow_alert_flag = true;
-					}
-				} else {
-					//Could not convert to a valid number. If a number is not detected as a station name suffix, never send an alert
-					flow_alert_flag = false;
+					flow_alert_flag = true;
 				}
-			} else {
- 				//Station name was not long enough to include 5 character flow setpoint.
-				flow_alert_flag = false;
 			}
 
+					//flow_last_gpm is actually collected and stored as pulses per minute, not gallons per minute
+					// Alert Check - Compare flow_gpm_alert_setpoint with flow_last_gpm and enable flow_alert_flag if flow is above setpoint
+			flow_alert_flag = flow_alert_flag && flow_last_gpm > 0 && ((flow_last_gpm*flowrate100/100.f) > flow_gpm_alert_setpoint);
+
 			// If flow_alert_flag is true, format the appropriate messages, else don't send alert
-			if (flow_alert_flag == true) {
+			if (flow_alert_flag) {
 
 				if (os.mqtt.enabled()) {
 					//Format mqtt message
