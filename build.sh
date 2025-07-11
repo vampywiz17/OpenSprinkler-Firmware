@@ -95,7 +95,7 @@ if [ -f /etc/init.d/OpenSprinkler.sh ]; then
     rm /etc/init.d/OpenSprinkler.sh
 fi
 
-if [ ! "$SILENT" = true ] && [ -f OpenSprinkler.service ] && [ -f startOpenSprinkler.sh ] && [ ! -f /etc/systemd/system/OpenSprinkler.service ]; then
+if [ "$SILENT" ] || [ -f OpenSprinkler.service ] && [ -f startOpenSprinkler.sh ] && [ ! -f /etc/systemd/system/OpenSprinkler.service ]; then
 
 	read -p "Do you want to start OpenSprinkler on startup? " -n 1 -r
 	echo
