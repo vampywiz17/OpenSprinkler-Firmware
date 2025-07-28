@@ -71,6 +71,7 @@ static void getweather_callback(char* buffer) {
 		}
 	}
 
+	/* Use own sunrise/sunset calculation 
 	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("sunrise"), true)) {
 		v = atoi(tmp_buffer);
 		if (v>=0 && v<=1440 && v != os.nvdata.sunrise_time) {
@@ -87,7 +88,7 @@ static void getweather_callback(char* buffer) {
 			save_nvdata = true;
 			os.weather_update_flag |= WEATHER_UPDATE_SUNSET;
 		}
-	}
+	}*/
 
 	if (findKeyVal(p, tmp_buffer, TMP_BUFFER_SIZE, PSTR("eip"), true)) {
 		uint32_t l = strtoul(tmp_buffer, NULL, 0);
@@ -136,7 +137,7 @@ static void getweather_callback_with_peel_header(char* buffer) {
 void GetWeather() {
 	if(!os.network_connected()) return;
 	// use temp buffer to construct get command
-	BufferFiller bf = BufferFiller(tmp_buffer, TMP_BUFFER_SIZE*2);
+	BufferFiller bf = BufferFiller(tmp_buffer, TMP_BUFFER_SIZE_L);
 	int method = os.iopts[IOPT_USE_WEATHER];
 	// use manual adjustment call for monthly adjustment -- a bit ugly, but does not involve weather server changes
 	if(method==WEATHER_METHOD_MONTHLY) method=WEATHER_METHOD_MANUAL;

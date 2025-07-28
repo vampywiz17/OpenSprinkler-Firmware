@@ -482,4 +482,6 @@ private:
 	#endif
 };
 
+void calc_sunrise_sunset(); // calculate sunrise and sunset time
+
 #endif  // _OPENSPRINKLER_H

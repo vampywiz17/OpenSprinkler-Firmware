@@ -102,11 +102,15 @@ uint8_t logFileSwitch[3] = {0, 0, 0};  // 0=use smaller File, 1=LOG1, 2=LOG2
 
 // Weather
 time_t last_weather_time = 0;
+time_t last_weather_time_eto = 0;
 bool current_weather_ok = false;
+bool current_weather_eto_ok = false;
 double current_temp = 0.0;
 double current_humidity = 0.0;
 double current_precip = 0.0;
 double current_wind = 0.0;
+double current_eto = 0.0;
+double current_radiation = 0.0;
 
 uint16_t CRC16(unsigned char buf[], int len) {
   uint16_t crc = 0xFFFF;
@@ -1705,6 +1709,32 @@ int read_sensor(Sensor_t *sensor, ulong time) {
         }
         return HTTP_RQT_SUCCESS;
       }
+      break;
+    }
+    case SENSOR_WEATHER_ETO:
+    case SENSOR_WEATHER_RADIATION: {
+      GetSensorWeatherEto();
+      if (current_weather_eto_ok) {
+        DEBUG_PRINT(F("Reading sensor "));
+        DEBUG_PRINTLN(sensor->name);
+
+        sensor->last_read = time;
+        sensor->last_native_data = 0;
+        sensor->flags.data_ok = true;
+
+        switch (sensor->type) {
+          case SENSOR_WEATHER_ETO: {
+            sensor->last_data = current_eto;
+            break;
+          }
+          case SENSOR_WEATHER_RADIATION: {
+            sensor->last_data = current_radiation;
+            break;
+          }
+        }
+        return HTTP_RQT_SUCCESS;
+      }
+      break;
     }
   }
   return HTTP_RQT_NOT_RECEIVED;
@@ -2439,30 +2469,14 @@ void GetSensorWeather() {
 
   // use temp buffer to construct get command
   BufferFiller bf = BufferFiller(tmp_buffer, TMP_BUFFER_SIZE);
-  bf.emit_p(PSTR("weatherData?loc=$O&wto=$O"), SOPT_LOCATION,
-            SOPT_WEATHER_OPTS);
+  bf.emit_p(PSTR("weatherData?loc=$O&wto=$O&fwv=$D"), SOPT_LOCATION,
+            SOPT_WEATHER_OPTS,
+            (int)os.iopts[IOPT_FW_VERSION]);
 
-  char *src = tmp_buffer + strlen(tmp_buffer);
-  char *dst = tmp_buffer + TMP_BUFFER_SIZE - 12;
-
-  char c;
-  // url encode. convert SPACE to %20
-  // copy reversely from the end because we are potentially expanding
-  // the string size
-  while (src != tmp_buffer) {
-    c = *src--;
-    if (c == ' ') {
-      *dst-- = '0';
-      *dst-- = '2';
-      *dst-- = '%';
-    } else {
-      *dst-- = c;
-    }
-  };
-  *dst = *src;
+  urlEncode(tmp_buffer);
 
   strcpy(ether_buffer, "GET /");
-  strcat(ether_buffer, dst);
+  strcat(ether_buffer, tmp_buffer);
   // because dst is part of tmp_buffer,
   // must load weather url AFTER dst is copied to ether_buffer
 
@@ -2472,13 +2486,15 @@ void GetSensorWeather() {
 
   strcat(ether_buffer, " HTTP/1.0\r\nHOST: ");
   strcat(ether_buffer, host);
-  strcat(ether_buffer, "\r\n\r\n");
+  strcat(ether_buffer, "\r\nUser-Agent: ");
+	strcat(ether_buffer, user_agent_string);
+	strcat(ether_buffer, "\r\n\r\n");
 
   DEBUG_PRINTLN(F("GetSensorWeather"));
   DEBUG_PRINTLN(ether_buffer);
 
   last_weather_time = time;
-  int ret = os.send_http_request(host, ether_buffer, NULL, false, 500);
+  int ret = os.send_http_request(host, ether_buffer);
   if (ret == HTTP_RQT_SUCCESS) {
     DEBUG_PRINTLN(ether_buffer);
 
@@ -2517,6 +2533,64 @@ void GetSensorWeather() {
     current_weather_ok = true;
   } else {
     current_weather_ok = false;
+  }
+}
+
+void GetSensorWeatherEto() {
+#if defined(ESP8266)
+  if (!useEth)
+    if (os.state != OS_STATE_CONNECTED || WiFi.status() != WL_CONNECTED) return;
+#endif
+  time_t time = os.now_tz();
+  if (last_weather_time_eto == 0) last_weather_time_eto = time - 59 * 60;
+
+  if (time < last_weather_time_eto + 60 * 60) return;
+
+  // use temp buffer to construct get command
+  BufferFiller bf = BufferFiller(tmp_buffer, TMP_BUFFER_SIZE);
+  bf.emit_p(PSTR("$D?loc=$O&wto=$O&fwv=$D"),
+								WEATHER_METHOD_ETO,
+								SOPT_LOCATION,
+								SOPT_WEATHER_OPTS,
+								(int)os.iopts[IOPT_FW_VERSION]);
+  
+  urlEncode(tmp_buffer);
+
+  strcpy(ether_buffer, "GET /");
+  strcat(ether_buffer, tmp_buffer);
+  // because dst is part of tmp_buffer,
+  // must load weather url AFTER dst is copied to ether_buffer
+
+  // load weather url to tmp_buffer
+  char *host = tmp_buffer;
+  os.sopt_load(SOPT_WEATHERURL, host);
+
+  strcat(ether_buffer, " HTTP/1.0\r\nHOST: ");
+  strcat(ether_buffer, host);
+  strcat(ether_buffer, "\r\nUser-Agent: ");
+	strcat(ether_buffer, user_agent_string);
+	strcat(ether_buffer, "\r\n\r\n");
+
+  DEBUG_PRINTLN(F("GetSensorWeather"));
+  DEBUG_PRINTLN(ether_buffer);
+
+  last_weather_time_eto = time;
+  int ret = os.send_http_request(host, ether_buffer);
+  if (ret == HTTP_RQT_SUCCESS) {
+    DEBUG_PRINTLN(ether_buffer);
+
+    char buf[20];
+    char *s = strstr(ether_buffer, "\"eto\":");
+    if (s && extract(s, buf, sizeof(buf))) {
+      current_eto = atof(buf);
+    }
+    s = strstr(ether_buffer, "\"radiation\":");
+    if (s && extract(s, buf, sizeof(buf))) {
+      current_radiation = atof(buf);
+    }
+    current_weather_eto_ok = true;
+  } else {
+    current_weather_eto_ok = false;
   }
 }
 

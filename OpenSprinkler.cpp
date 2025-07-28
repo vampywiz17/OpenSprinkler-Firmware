@@ -27,6 +27,7 @@
 #include "testmode.h"
 #include "program.h"
 #include "ArduinoJson.hpp"
+#include <sunrise.h>
 
 /** Declare static data members */
 OSMqtt OpenSprinkler::mqtt;
@@ -572,7 +573,7 @@ bool init_W5500(boolean initSPI) {
 		SPI.begin();
 		SPI.setBitOrder(MSBFIRST);
 		SPI.setDataMode(SPI_MODE0);
-		SPI.setFrequency(80000000); // 80MHz is the maximum SPI clock for W5500
+		SPI.setFrequency(40000000); // 80MHz is the maximum SPI clock for W5500 - we init for 40MHz
 	}
 	
 		pinMode(PIN_ETHER_CS, OUTPUT);
@@ -767,6 +768,7 @@ void OpenSprinkler::reboot_dev(uint8_t cause) {
 #include <net/if.h>
 #include "utils.h"
 #include "opensprinkler_server.h"
+#include "Sunrise.h"
 
 /** Initialize network with the given mac address and http port */
 unsigned char OpenSprinkler::start_network() {
@@ -3167,6 +3169,30 @@ void OpenSprinkler::lcd_set_brightness(unsigned char value) {
 #endif
 }
 
+void calc_sunrise_sunset() { // calculate sunrise and sunset time
+	char loc[MAX_SOPTS_SIZE];
+	float latitude, longitude;
+	file_read_block(SOPTS_FILENAME, (char*) loc, SOPT_LOCATION*MAX_SOPTS_SIZE, MAX_SOPTS_SIZE);
+	DEBUG_PRINT(F("loc: "));
+	DEBUG_PRINTLN(loc);
+	if (sscanf(loc, "%f,%f", &latitude, &longitude) != 2) return;
+	DEBUG_PRINT(F("lat/long: "));
+	DEBUG_PRINT(latitude);
+	DEBUG_PRINT(",");
+	DEBUG_PRINTLN(longitude);
+	Sunrise sunrise(latitude, longitude, (os.iopts[IOPT_TIMEZONE]-48)/4);
+
+	DEBUG_PRINT(F("month/day: "));
+	DEBUG_PRINT(month());
+	DEBUG_PRINT(".");
+	DEBUG_PRINTLN(day());
+	os.nvdata.sunrise_time = sunrise.Rise(month(), day()); // calculate sunrise and sunset time for today
+	os.nvdata.sunset_time = sunrise.Set(month(), day());
+	DEBUG_PRINT(F("sunrise/sunset: "));
+	DEBUG_PRINT(os.nvdata.sunrise_time);
+	DEBUG_PRINT(" - ");
+	DEBUG_PRINTLN(os.nvdata.sunset_time);
+}
 
 
 #if defined(USE_SSD1306)

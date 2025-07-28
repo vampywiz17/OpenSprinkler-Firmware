@@ -751,7 +751,7 @@ void do_loop()
 
 		last_time = curr_time;
 		if (os.button_timeout) os.button_timeout--;
-
+		
 #if defined(USE_DISPLAY)
 		if (!ui_state)
 			os.lcd_print_time(curr_time);  // print time
@@ -837,16 +837,19 @@ void do_loop()
 			for(pid=0; pid<pd.nprograms; pid++) {
 				pd.read(pid, &prog);	// todo future: reduce load time
 				bool will_delete = false;
-				unsigned char runcount = prog.check_match(curr_time, &will_delete);
-				if(runcount>0) {
+
+				// Check if a program is starting in the next 5 minutes:
+				if(prog.check_match(curr_time+5*60, &will_delete)) {
 					// Check and update weather if weatherdata is older than 30min:
 					if (os.checkwt_success_lasttime && (!os.checkwt_lasttime || os.now_tz() > os.checkwt_lasttime + 30*60)) {
 						os.checkwt_lasttime = 0;
 						os.checkwt_success_lasttime = 0;
 						check_weather();
 					}
-					//break;
+				}
 
+				unsigned char runcount = prog.check_match(curr_time, &will_delete);
+				if(runcount>0) {
 					// program match found
 					// check and process special program command
 					if(process_special_program_command(prog.name, curr_time))	continue;
@@ -1974,12 +1977,17 @@ static void perform_ntp_sync() {
 		if (t>0) {
 			setTime(t);
 			RTC.set(t);
+			calc_sunrise_sunset();
 			DEBUG_PRINTLN(RTC.get());
 		}
 	}
 #else
 	// nothing to do here
 	// Linux will do this for you
+	if (os.status.req_ntpsync) {
+		os.status.req_ntpsync = 0;	
+		calc_sunrise_sunset();
+	}
 #endif
 }
 

@@ -101,6 +101,8 @@ extern "C" {
 #define SENSOR_WEATHER_PRECIP_MM        106 // Weather service - precip (mm)
 #define SENSOR_WEATHER_WIND_MPH         107 // Weather service - wind (mph)
 #define SENSOR_WEATHER_WIND_KMH         108 // Weather service - wind (kmh)
+#define SENSOR_WEATHER_ETO              109 // Weather service - ETO
+#define SENSOR_WEATHER_RADIATION        110 // Weather service - radiation
 
 #define SENSOR_GROUP_MIN                1000 // Sensor group with min value
 #define SENSOR_GROUP_MAX                1001 // Sensor group with max value
@@ -354,6 +356,7 @@ extern char tmp_buffer[];
 extern OpenSprinkler os;
 extern ProgramData pd;
 extern NotifQueue notif;
+extern const char *user_agent_string;
 
 // Utils:
 uint16_t CRC16(unsigned char buf[], int len);
@@ -422,6 +425,7 @@ double calc_sensor_watering_by_nr(uint nr);
 double calc_sensor_watering_int(ProgSensorAdjust_t *p, double sensorData);
 
 void GetSensorWeather();
+void GetSensorWeatherEto();
 // PUSH Message to MQTT and others:
 void push_message(Sensor_t *sensor);
 
