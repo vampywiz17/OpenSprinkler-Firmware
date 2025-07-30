@@ -1,5 +1,5 @@
-#include <sunrise.h>
-#include <Math.h>
+#include "sunrise.h"
+#include <math.h>
 
 Sunrise::Sunrise(float latitude, float longitude, float timezone){
 	rd=57.295779513082322;

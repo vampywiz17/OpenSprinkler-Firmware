@@ -35,7 +35,7 @@
         otf=$(ls external/OpenThings-Framework-Firmware-Library/*.cpp)
         ifx=$(ls external/influxdb-cpp/*.hpp)
         g++ -o OpenSprinkler -DOSPI $USEGPIO $ADS1115 $PCF8591 -DSMTP_OPENSSL $DEBUG -std=c++17 -include string.h main.cpp \
-                OpenSprinkler.cpp program.cpp opensprinkler_server.cpp utils.cpp weather.cpp gpio.cpp mqtt.cpp \
+                OpenSprinkler.cpp program.cpp opensprinkler_server.cpp utils.cpp weather.cpp gpio.cpp mqtt.cpp sunrise.cpp \
                 smtp.c RCSwitch.cpp sensor*.cpp notifier.cpp \
                 $ADS1115FILES $PCF8591FILES \
                 -Iexternal/TinyWebsockets/tiny_websockets_lib/include \
