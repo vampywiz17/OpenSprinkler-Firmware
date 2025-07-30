@@ -3183,11 +3183,11 @@ void calc_sunrise_sunset() { // calculate sunrise and sunset time
 	Sunrise sunrise(latitude, longitude, (os.iopts[IOPT_TIMEZONE]-48)/4);
 
 	DEBUG_PRINT(F("month/day: "));
-	DEBUG_PRINT(month());
+	DEBUG_PRINT(month(curr_time));
 	DEBUG_PRINT(".");
-	DEBUG_PRINTLN(day());
-	os.nvdata.sunrise_time = sunrise.Rise(month(), day()); // calculate sunrise and sunset time for today
-	os.nvdata.sunset_time = sunrise.Set(month(), day());
+	DEBUG_PRINTLN(day(curr_time));
+	os.nvdata.sunrise_time = sunrise.Rise(month(curr_time), day(curr_time)); // calculate sunrise and sunset time for today
+	os.nvdata.sunset_time = sunrise.Set(month(curr_time), day(curr_time));
 	DEBUG_PRINT(F("sunrise/sunset: "));
 	DEBUG_PRINT(os.nvdata.sunrise_time);
 	DEBUG_PRINT(" - ");
