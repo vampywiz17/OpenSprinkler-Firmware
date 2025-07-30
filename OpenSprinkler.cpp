@@ -27,7 +27,7 @@
 #include "testmode.h"
 #include "program.h"
 #include "ArduinoJson.hpp"
-#include <sunrise.h>
+#include "sunrise.h"
 
 /** Declare static data members */
 OSMqtt OpenSprinkler::mqtt;
