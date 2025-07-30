@@ -768,7 +768,7 @@ void OpenSprinkler::reboot_dev(uint8_t cause) {
 #include <net/if.h>
 #include "utils.h"
 #include "opensprinkler_server.h"
-#include "Sunrise.h"
+#include "sunrise.h"
 
 /** Initialize network with the given mac address and http port */
 unsigned char OpenSprinkler::start_network() {
