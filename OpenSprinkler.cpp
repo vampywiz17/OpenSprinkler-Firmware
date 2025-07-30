@@ -3182,7 +3182,7 @@ void calc_sunrise_sunset() { // calculate sunrise and sunset time
 	DEBUG_PRINTLN(longitude);
 	Sunrise sunrise(latitude, longitude, (os.iopts[IOPT_TIMEZONE]-48)/4);
 
-	time_os_t curr_time = now_tz();
+	time_os_t curr_time = os.now_tz();
 	DEBUG_PRINT(F("month/day: "));
 	DEBUG_PRINT(month(curr_time));
 	DEBUG_PRINT(".");
