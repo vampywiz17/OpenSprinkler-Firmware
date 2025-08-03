@@ -1023,7 +1023,6 @@ void read_all_sensors(boolean online) {
       if (online || (current_sensor->ip == 0 && current_sensor->type != SENSOR_MQTT)) {
         int result = read_sensor(current_sensor, time);
         if (result == HTTP_RQT_SUCCESS) {
-          check_monitors();
           sensorlog_add(LOG_STD, current_sensor, time);
           push_message(current_sensor);
         } else if (result == HTTP_RQT_TIMEOUT) {
@@ -1048,6 +1047,7 @@ void read_all_sensors(boolean online) {
   }
   sensor_update_groups();
   calc_sensorlogs();
+  check_monitors();
   if (time - last_save_time > 3600)  // 1h
     sensor_save();
 }
@@ -2789,6 +2789,10 @@ void monitor_load() {
   DEBUG_PRINTLN(F("monitor_load"));
   monitors = NULL;
   if (!file_exists(MONITOR_FILENAME)) return;
+  DEBUG_PRINT(F("monitor_load_size: "));
+  DEBUG_PRINTLN(file_size(MONITOR_FILENAME));
+  DEBUG_PRINT(F("monitor_load_store_size: "))
+  DEBUG_PRINTLN(MONITOR_STORE_SIZE);
   if (file_size(MONITOR_FILENAME) % MONITOR_STORE_SIZE != 0) return;
   
   ulong pos = 0;
@@ -2855,7 +2859,7 @@ int monitor_delete(uint nr) {
   return HTTP_RQT_NOT_RECEIVED;
 }
 
-bool monitor_define(uint nr, uint type, uint sensor, uint prog, uint zone, const Monitor_Union_t m, char * name, ulong maxRuntime, uint8_t prio) {
+bool monitor_define(uint nr, uint type, uint sensor, uint prog, uint zone, const Monitor_Union_t m, char * name, ulong maxRuntime, uint8_t prio, ulong reset_seconds) {
   Monitor_t *p = monitors;
 
   Monitor_t *last = NULL;
@@ -2870,6 +2874,9 @@ bool monitor_define(uint nr, uint type, uint sensor, uint prog, uint zone, const
       //p->active = false;
       p->maxRuntime = maxRuntime;
       p->prio = prio;
+      p->reset_time = 0;
+      p->reset_seconds = reset_seconds;
+
       strncpy(p->name, name, sizeof(p->name)-1);
       monitor_save();
       check_monitors();
@@ -2892,6 +2899,9 @@ bool monitor_define(uint nr, uint type, uint sensor, uint prog, uint zone, const
   p->active = false;
   p->maxRuntime = maxRuntime;
   p->prio = prio;
+  p->reset_time = 0;
+  p->reset_seconds = reset_seconds;
+
   strncpy(p->name, name, sizeof(p->name)-1);
   if (last) {
     p->next = last->next;
@@ -2934,6 +2944,12 @@ void start_monitor_action(Monitor_t * mon) {
   if (mon->prog > 0)
     manual_start_program(mon->prog, 255);
 
+  DEBUG_PRINTLN(F("start_monitor_action"));
+  DEBUG_PRINT(F("Zone: "));
+  DEBUG_PRINTLN(mon->zone);
+  DEBUG_PRINT(F("Max Runtime: "));
+  DEBUG_PRINTLN(mon->maxRuntime);
+
   if (mon->zone > 0) {
     uint sid = mon->zone-1;
 
@@ -2953,12 +2969,14 @@ void start_monitor_action(Monitor_t * mon) {
 			q = pd.enqueue();
 		}
 		// if the queue is not full
+    DEBUG_PRINTLN(F("start_monitor_action: queue not full"));
 		if (q) {
 			q->st = 0;
 			q->dur = timer;
 			q->sid = sid;
 			q->pid = 253;
 			schedule_all_stations(mon->time);
+      DEBUG_PRINTLN(F("start_monitor_action: schedule_all_stations"));
 		} 
   }
 }
@@ -3051,6 +3069,9 @@ bool get_remote_monitor(Monitor_t *mon, bool defaultBool) {
 }
 
 void check_monitors() {
+  //DEBUG_PRINTLN(F("check_monitors"));
+  time_os_t timeNow = os.now_tz();
+
   Monitor_t *mon = monitors;
   int monidx = 0;
   while (mon) {
@@ -3120,7 +3141,6 @@ void check_monitors() {
         mon->active = get_monitor(mon->m.mnot.monitor, true, false);
         break;
       case MONITOR_TIME: {
-        time_os_t timeNow = os.now_tz();
         uint16_t time = hour(timeNow) * 100 + minute(timeNow); //HHMM
 #if defined(ARDUINO)       
         uint8_t wday = (weekday(timeNow)+5)%7; //Monday = 0
@@ -3142,12 +3162,35 @@ void check_monitors() {
     }
 
     if (mon->active != wasActive) {
+      DEBUG_PRINT(F("Monitor "));
+      DEBUG_PRINT(mon->nr);
+      DEBUG_PRINT(F(" changed from "));
+      DEBUG_PRINT(wasActive ? "active" : "inactive");
+      DEBUG_PRINT(F(" to "));
+      DEBUG_PRINTLN(mon->active ? "active" : "inactive");
       if (mon->active) {
+        if (mon->reset_seconds > 0) {
+          mon->reset_time = timeNow + mon->reset_seconds; 
+        } else {
+          mon->reset_time = 0;
+        }
         start_monitor_action(mon);
         push_message(mon, value, monidx);
         mon = monitor_by_nr(nr); //restart because if send by mail we unloaded+reloaded the monitors
       } else {
         stop_monitor_action(mon);
+      }
+    } else if (mon->active) {
+      if (mon->reset_time > 0 && mon->reset_time < timeNow) { //time is over
+        mon->active = false;
+        DEBUG_PRINT(F("Monitor "));
+        DEBUG_PRINT(mon->nr);
+        DEBUG_PRINT(F(" time is over at "));
+        DEBUG_PRINTLN(timeNow);
+        stop_monitor_action(mon);
+        mon->reset_time = timeNow + mon->reset_seconds; 
+      } else if (mon->reset_time == 0 && mon->reset_seconds > 0) { //reset time not set, but reset seconds is set
+        mon->reset_time = timeNow + mon->reset_seconds; 
       }
     }
 

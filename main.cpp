@@ -1480,10 +1480,24 @@ void reset_all_stations_immediate() {
  */
 void reset_all_stations() {
 	RuntimeQueueStruct *q = pd.queue;
+	#if defined(ESP8266)
+	uint16_t t = 0;
+	#endif
 	// go through runtime queue and assign water time to 0
 	for(;q<pd.queue+pd.nqueue;q++) {
+		#if defined(ESP8266)
+		t += q->dur;
+		#endif
 		q->dur = 0;
 	}
+#if defined(ESP8266)
+	if (t == 0 && os.hw_type==HW_TYPE_LATCH) {
+		// if this is a latch controller, reset all station bits
+		for(unsigned char i=0;i<os.nstations;i++) {
+			os.force_close_latch(i);
+		}
+	}
+#endif
 }
 
 

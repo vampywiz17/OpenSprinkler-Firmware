@@ -1297,6 +1297,17 @@ void OpenSprinkler::latch_open(unsigned char sid) {
 	}
 }
 
+void OpenSprinkler::force_close_latch(unsigned char sid) {
+	if (os.hw_type==HW_TYPE_LATCH) {
+		unsigned char bid=sid>>3,s=sid&0x07;
+		if(os.attrib_spe[bid]&(1<<s)) return; // if this is a special stations
+		unsigned char stype = get_station_type(sid);
+		if(stype==STN_TYPE_STANDARD) {
+			latch_close(sid); // force close latch
+		}
+	}
+}
+
 void OpenSprinkler::latch_close(unsigned char sid) {
 	if(hw_rev>=2) {
 		DEBUG_PRINTLN(F("latch_close_v2"));

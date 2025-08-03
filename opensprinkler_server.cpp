@@ -3109,6 +3109,10 @@ void server_monitor_config(OTF_PARAMS_DEF) {
 	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("port"), true))
 		port = strtoul(tmp_buffer, NULL, 0); 
 
+	ulong reset_seconds = 0;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("rs"), true))
+		reset_seconds = strtoul(tmp_buffer, NULL, 0); 
+
 	Monitor_Union_t m; 
 	switch (type) {
 		case MONITOR_MIN:
@@ -3138,13 +3142,13 @@ void server_monitor_config(OTF_PARAMS_DEF) {
 			break;
 		default: handle_return(HTML_DATA_FORMATERROR);
 	}
-	int ret = monitor_define(nr, type, sensor, prog, zone, m, name, maxRuntime, prio);
+	int ret = monitor_define(nr, type, sensor, prog, zone, m, name, maxRuntime, prio, reset_seconds);
 	ret = ret >= HTTP_RQT_SUCCESS?HTML_SUCCESS:HTML_DATA_MISSING;
 	handle_return(ret);
 }
 
 void monitorconfig_json(Monitor_t *mon) {
-	bfill.emit_p(PSTR("{\"nr\":$D,\"type\":$D,\"sensor\":$D,\"prog\":$D,\"zone\":$D,\"name\":\"$S\",\"maxrun\":$L,\"prio\":$D,\"active\":$D,\"time\":$L,"),
+	bfill.emit_p(PSTR("{\"nr\":$D,\"type\":$D,\"sensor\":$D,\"prog\":$D,\"zone\":$D,\"name\":\"$S\",\"maxrun\":$L,\"prio\":$D,\"active\":$D,\"time\":$L,\"rs\":$L,\"ts\":$L,"),
 				mon->nr,
 				mon->type,
 				mon->sensor,
@@ -3154,7 +3158,9 @@ void monitorconfig_json(Monitor_t *mon) {
 				mon->maxRuntime,
 				mon->prio,
 				mon->active,
-				mon->time);
+				mon->time,
+				mon->reset_seconds,
+			    mon->reset_time? mon->reset_time-os.now_tz():0);
 
 	switch(mon->type) {
 		case MONITOR_MIN:

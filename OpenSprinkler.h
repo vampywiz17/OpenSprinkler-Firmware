@@ -448,6 +448,7 @@ public:
 	static void save_wifi_ip();
 	static void reset_to_ap();
 	static unsigned char state;
+	static void force_close_latch(unsigned char sid);
 	#endif
 
 #else
