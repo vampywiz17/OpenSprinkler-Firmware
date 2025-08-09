@@ -871,16 +871,19 @@ void do_loop()
 							// water time is scaled by watering percentage
 							ulong water_time = water_time_resolve(prog.durations[sid]);
 							// if the program is set to use weather scaling
-							if (prog.use_weather) {
-								unsigned char wl = os.iopts[IOPT_WATER_PERCENTAGE];
-								water_time = water_time * wl / 100;
-								if (wl < 20 && water_time < 10) // if water_percentage is less than 20% and water_time is less than 10 seconds
-																								// do not water
-									water_time = 0;
+							double wl = prog.use_weather?os.iopts[IOPT_WATER_PERCENTAGE] : 100;
+							wl = wl / 100 * calc_sensor_watering(pid); //Analog Sensor program adjustment
+							water_time = water_time * wl;
+							// Belowmode handling:
+							uint16_t below_value = os.iopts[IOPT_BELOW2] | os.iopts[IOPT_BELOW1] << 8;
+							switch (os.iopts[IOPT_BELOW_HANDLING]) {
+								case BELOW_MINIMAL_PERCENT: if (wl < below_value) water_time = below_value; break;
+								case BELOW_DISABLED_PERCENT: if (wl < below_value) water_time = 0; break;
+								case BELOW_MINIMAL_SECONDS: if (water_time < below_value) water_time = below_value; break;
+								case BELOW_DISABLED_SECONDS: if (water_time < below_value) water_time = 0; break;
+								case BELOW_MINIMAL_MINUTES: if (water_time < below_value*60) water_time = below_value*60; break;
+								case BELOW_DISABLED_MINUTES: if (water_time < below_value*60) water_time = 0; break;
 							}
-
-							// Analog sensor water time adjustments:
-							water_time = (ulong)((double)water_time * calc_sensor_watering(pid));
 
 							if (water_time) {
 								// check if water time is still valid

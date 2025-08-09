@@ -36,7 +36,7 @@ typedef unsigned long ulong;
 														// if this number is different from the one stored in non-volatile memory
 														// a device reset will be automatically triggered
 
-#define OS_FW_MINOR      178  // Firmware minor version
+#define OS_FW_MINOR      179  // Firmware minor version
 
 /** Hardware version base numbers */
 #define OS_HW_VERSION_BASE   0x00 // OpenSprinkler
@@ -190,6 +190,17 @@ enum {
 	NUM_MASTER_OPTS,
 };
 
+enum {
+	BELOW_MODE_NONE = 0, // no below handling
+	BELOW_MINIMAL_PERCENT, // adjust runtime to minimal percentage
+	BELOW_DISABLED_PERCENT, // disable stations if runtime is below minimal percentage
+	BELOW_MINIMAL_SECONDS, // adjust runtime to minimal seconds if runtime is below seconds
+	BELOW_DISABLED_SECONDS, // disable stations if runtime is shorter than seconds
+	BELOW_MINIMAL_MINUTES, // adjust station to minutes if runtime is below minutes
+	BELOW_DISABLED_MINUTES, // disable stations if runtime is shorter than minutes
+	NUM_BELOW_MODES,
+};
+
 // Sequential Groups
 #define NUM_SEQ_GROUPS		4
 #define PARALLEL_GROUP_ID	255
@@ -266,9 +277,9 @@ enum {
 	IOPT_NOTIF2_ENABLE,
 	IOPT_RESERVE_4,
 	IOPT_RESERVE_5,
-	IOPT_RESERVE_6,
-	IOPT_RESERVE_7,
-	IOPT_RESERVE_8,
+	IOPT_BELOW_HANDLING,
+	IOPT_BELOW1,
+	IOPT_BELOW2,
 	IOPT_WIFI_MODE, //ro
 	IOPT_RESET,     //ro
 	NUM_IOPTS // total number of integer options

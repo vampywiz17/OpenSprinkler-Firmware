@@ -1360,6 +1360,13 @@ void server_json_controller_main(OTF_PARAMS_DEF) {
 	server_influx_get_main();
 	//end influxdb
 
+	//belowmode
+	if (available_ether_buffer() <=0 ) {
+		send_packet(OTF_PARAMS);
+	}
+	uint16_t below_value = os.iopts[IOPT_BELOW2] | os.iopts[IOPT_BELOW1] << 8;
+	bfill.emit_p(PSTR(",\"belowmode\":$D,\"belowvalue\":$D"), os.iopts[IOPT_BELOW_HANDLING], below_value);
+	//end belowmode
 
 	bfill.emit_p(PSTR("}"));
 }
@@ -1673,6 +1680,17 @@ void server_change_options(OTF_PARAMS_DEF)
 		os.influxdb.set_influx_config(tmp_buffer);
 	}
 	//end influxdb set
+
+	//below mode
+	if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("belowmode"), true)) {
+		os.iopts[IOPT_BELOW_HANDLING] = atoi(tmp_buffer);
+	}
+	if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("belowvalue"), true)) {
+		uint16_t below_value = atoi(tmp_buffer);
+		os.iopts[IOPT_BELOW1] = (below_value >> 8) & 0xFF;
+		os.iopts[IOPT_BELOW2] = below_value & 0xFF;
+	}
+	//end below mode
 
 	keyfound = 0;
 	if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("email"), true, &keyfound)) {
