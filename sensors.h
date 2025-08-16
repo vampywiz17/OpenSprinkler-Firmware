@@ -450,6 +450,12 @@ Monitor_t * monitor_by_nr(uint nr);
 Monitor_t * monitor_by_idx(uint idx);
 void check_monitors();
 
+#if defined(OSPI)
+boolean send_rs485_command(uint8_t device, uint8_t address, uint16_t reg,uint16_t data);
+#elif defined(ESP8266)
+boolean send_rs485_command(uint32_t ip, uint16_t port, uint8_t address, uint16_t reg,uint16_t data);
+#endif
+
 #if defined(ESP8266)
 ulong diskFree();
 bool checkDiskFree();  // true: disk space Ok, false: Out of disk space

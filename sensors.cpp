@@ -77,7 +77,7 @@ static uint16_t modbusTcpId = 0;
 #ifdef ESP8266
 static uint i2c_rs485_allocated[MAX_RS485_DEVICES];
 #else
-static modbus_t * ttyDevices[MAX_RS485_DEVICES];
+static modbus_t * modbusDevs[MAX_RS485_DEVICES];
 #endif
 
 const char *sensor_unitNames[]{
@@ -201,7 +201,20 @@ void sensor_api_init(boolean detect_boards) {
     int n = 0;
     DEBUG_PRINTLN(F("Opening USB RS485 Adapters:"));
     while (std::getline(file, tty)) {
-      modbus_t * ctx = modbus_new_rtu(tty.c_str(), 9600, 'E', 8, 1);
+      modbus_t * ctx;
+      if (tty.contains(".") || tty.contains(":")) {
+        if (tty.contains(":")) {
+          // IP:port
+          std::string host = tty.substr(0, tty.find(':'));
+          std::string port = tty.substr(tty.find(':') + 1);
+          ctx = modbus_new_tcp(host.c_str(), atoi(port.c_str()));
+        } else {
+          // IP only
+          ctx = modbus_new_tcp(tty.c_str(), 502);
+        }
+      }
+      else
+        ctx = modbus_new_rtu(tty.c_str(), 9600, 'E', 8, 1);
       DEBUG_PRINT(idx);
       DEBUG_PRINT(": ");
       DEBUG_PRINTLN(tty.c_str());
@@ -214,7 +227,7 @@ void sensor_api_init(boolean detect_boards) {
         modbus_free(ctx);
       } else {
         n++;
-        ttyDevices[idx] = ctx;
+        modbusDevs[idx] = ctx;
         asb_detected_boards |= OSPI_USB_RS485;
         #ifdef ENABLE_DEBUG
         modbus_set_debug(ctx, TRUE);
@@ -239,11 +252,11 @@ void sensor_save_all() {
   monitor_save();
 #ifndef ESP8266
   for (int i = 0; i < MAX_RS485_DEVICES; i++) {
-    if (ttyDevices[i]) {
-      modbus_close(ttyDevices[i]);
-      modbus_free(ttyDevices[i]);
+    if (modbusDevs[i]) {
+      modbus_close(modbusDevs[i]);
+      modbus_free(modbusDevs[i]);
     }
-    ttyDevices[i] = NULL;
+    modbusDevs[i] = NULL;
   }
 #endif
 }
@@ -1338,6 +1351,77 @@ int read_sensor_rs485(Sensor_t *sensor) {
   DEBUG_PRINTLN(F("read_sensor_rs485: exit"));
   return HTTP_RQT_NOT_RECEIVED;
 }
+
+boolean send_rs485_command(uint32_t ip, uint16_t port, uint8_t address, uint16_t reg,uint16_t data) {
+#if defined(ARDUINO)
+
+  Client *client;
+#if defined(ESP8266)
+  WiFiClient wifiClient;
+  client = &wifiClient;
+#else
+  EthernetClient etherClient;
+  client = &etherClient;
+#endif
+
+#else
+  EthernetClient etherClient;
+  EthernetClient *client = &etherClient;
+#endif
+
+#if defined(ARDUINO)
+  IPAddress _ip(ip);
+  unsigned char ips[4] = {_ip[0], _ip[1], _ip[2], _ip[3]};
+#else
+  unsigned char ip[4];
+  ips[3] = (unsigned char)((ip >> 24) & 0xFF);
+  ips[2] = (unsigned char)((ip >> 16) & 0xFF);
+  ips[1] = (unsigned char)((ip >> 8) & 0xFF);
+  ips[0] = (unsigned char)((ip & 0xFF));
+#endif
+  char server[20];
+  sprintf(server, "%d.%d.%d.%d", ips[0], ips[1], ips[2], ips[3]);
+  client->setTimeout(200);
+  if (!client->connect(server, port)) {
+    DEBUG_PRINT(server);
+    DEBUG_PRINT(":");
+    DEBUG_PRINT(sensor->port);
+    DEBUG_PRINT(" ");
+    DEBUG_PRINTLN(F("failed."));
+    client->stop();
+    return false;
+  }
+
+  uint8_t buffer[20];
+
+  // https://ipc2u.com/articles/knowledge-base/detailed-description-of-the-modbus-tcp-protocol-with-command-examples/
+
+  if (modbusTcpId >= 0xFFFE)
+    modbusTcpId = 1;
+  else
+    modbusTcpId++;
+
+  buffer[0] = (0xFF00 & modbusTcpId) >> 8;
+  buffer[1] = (0x00FF & modbusTcpId);
+  buffer[2] = 0;
+  buffer[3] = 0;
+  buffer[4] = 0;
+  buffer[5] = 6;  // len
+  buffer[6] = address;  // Modbus ID
+  buffer[7] = 0x06;        // Write Registers
+  buffer[8] = reg >> 8;  // high byte of register address
+  buffer[9] = reg && 0xFF;  // low byte
+  buffer[10] = data >> 8;  // high byte
+  buffer[11] = data && 0xFF;  // low byte
+
+  client->write(buffer, 12);
+#if defined(ESP8266)
+  client->flush();
+#endif
+  client->stop();
+  return true;
+}
+
 #else
 /**
  * USB RS485 Adapter
@@ -1357,7 +1441,7 @@ int read_sensor_rs485(Sensor_t *sensor) {
 int read_sensor_rs485(Sensor_t *sensor) {
   DEBUG_PRINTLN(F("read_sensor_rs485"));
   int device = sensor->port;
-  if (device >= MAX_RS485_DEVICES || !ttyDevices[device])
+  if (device >= MAX_RS485_DEVICES || !modbusDevs[device])
     return HTTP_RQT_NOT_RECEIVED;
 
   DEBUG_PRINTLN(F("read_sensor_rs485: check-ok"));
@@ -1368,8 +1452,8 @@ int read_sensor_rs485(Sensor_t *sensor) {
   uint8_t type = isTemp ? 0x00 : isMois ? 0x01 : 0x02;
 
   uint16_t tab_reg[3] = {0};
-  modbus_set_slave(ttyDevices[device], sensor->id);
-  if (modbus_read_registers(ttyDevices[device], type, 2, tab_reg) > 0) {
+  modbus_set_slave(modbusDevs[device], sensor->id);
+  if (modbus_read_registers(modbusDevs[device], type, 2, tab_reg) > 0) {
     uint16_t data = tab_reg[0];
     DEBUG_PRINTF("read_sensor_rs485: result: %d - %d\n", sensor->id, data);
     double value = isTemp ? (data / 100.0) - 100.0 : (isMois ? data / 100.0 : data);
@@ -1381,6 +1465,14 @@ int read_sensor_rs485(Sensor_t *sensor) {
   }
   DEBUG_PRINTLN(F("read_sensor_rs485: exit"));
   return HTTP_RQT_NOT_RECEIVED;
+}
+
+boolean send_rs485_command(uint8_t device, uint8_t address, uint16_t reg, uint16_t data) {
+  if (device >= MAX_RS485_DEVICES || !modbusDevs[device])
+    return false;
+
+  modbus_set_slave(modbusDevs[device], address);
+  return modbus_write_register(modbusDevs[device], reg, data) > 0;
 }
 
 #endif
@@ -1938,7 +2030,7 @@ int set_sensor_address_rs485(Sensor_t *sensor, uint8_t new_address) {
 int set_sensor_address_rs485(Sensor_t *sensor, uint8_t new_address) {
   DEBUG_PRINTLN(F("set_sensor_address_rs485"));
   int device = sensor->port;
-  if (device >= MAX_RS485_DEVICES || !ttyDevices[device])
+  if (device >= MAX_RS485_DEVICES || !modbusDevs[device])
     return HTTP_RQT_NOT_RECEIVED;
 
 
@@ -1950,8 +2042,8 @@ int set_sensor_address_rs485(Sensor_t *sensor, uint8_t new_address) {
   request[4] = 0x00;
   request[5] = new_address;
   
-  if (modbus_send_raw_request(ttyDevices[device], request, 6) > 0) {
-    modbus_flush(ttyDevices[device]);
+  if (modbus_send_raw_request(modbusDevs[device], request, 6) > 0) {
+    modbus_flush(modbusDevs[device]);
     return HTTP_RQT_SUCCESS;
   }
   return HTTP_RQT_NOT_RECEIVED;

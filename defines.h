@@ -36,7 +36,7 @@ typedef unsigned long ulong;
 														// if this number is different from the one stored in non-volatile memory
 														// a device reset will be automatically triggered
 
-#define OS_FW_MINOR      179  // Firmware minor version
+#define OS_FW_MINOR      180  // Firmware minor version
 
 /** Hardware version base numbers */
 #define OS_HW_VERSION_BASE   0x00 // OpenSprinkler
@@ -67,6 +67,7 @@ typedef unsigned long ulong;
 #define STN_TYPE_HTTP        0x04	// HTTP station
 #define STN_TYPE_HTTPS       0x05	// HTTPS station
 #define STN_TYPE_REMOTE_OTC  0x06 // Remote OpenSprinkler station (by OTC)
+#define STN_TYPE_RS485	     0x07 // RS485 station
 #define STN_TYPE_OTHER       0xFF
 
 /** Notification macro defines */

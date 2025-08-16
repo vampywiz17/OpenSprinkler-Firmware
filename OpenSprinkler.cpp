@@ -1930,6 +1930,9 @@ void OpenSprinkler::switch_special_station(unsigned char sid, unsigned char valu
 			switch_httpstation((HTTPStationData *)pdata->sped, value, true);
 			break;
 
+		case STN_TYPE_RS485:
+			switch_modbusStation((ModbusStationData *)pdata->sped, value);
+			break;
 		}
 	}
 }
@@ -2260,6 +2263,42 @@ void OpenSprinkler::switch_httpstation(HTTPStationData *data, bool turnon, bool 
 	bf.emit_p(PSTR("User-Agent: $S\r\n\r\n"), user_agent_string);
 
 	send_http_request(server, atoi(port), p, remote_http_callback, usessl);
+}
+
+#if defined(OSPI)
+extern boolean send_rs485_command(uint8_t device, uint8_t address, uint16_t reg,uint16_t data);
+#elif defined(ESP8266)
+extern boolean send_rs485_command(uint32_t ip, uint16_t port, uint8_t address, uint16_t reg,uint16_t data);
+#endif
+
+void OpenSprinkler::switch_modbusStation(ModbusStationData *data, bool turnon) {
+	/*
+	unsigned char ip[8];    // ESP8266 only
+	unsigned char port[4];  // ESP8266 only
+	unsigned char device[2]; // OSPI only, lineindex (0 first) in modbusDevs array / rs485 file
+	unsigned char address[2];
+	unsigned char register_on[4];
+	unsigned char data_on[4];
+	unsigned char register_off[4];
+	unsigned char data_off[4];
+	*/
+
+#if defined(OSPI)
+	uint8_t device = (uint8_t)hex2ulong(data->device, sizeof(data->device));
+	uint8_t address = (uint8_t)hex2ulong(data->address, sizeof(data->address));
+	uint16_t reg = (uint16_t)hex2ulong(turnon ? data->register_on : data->register_off, sizeof(data->register_on));
+	uint16_t onoff = (uint16_t)hex2ulong(turnon ? data->data_on : data->data_off, sizeof(data->data_on));
+
+	send_rs485_command(device, address, reg, onoff);
+#elif defined(ESP8266)
+	uint32_t ip4 = hex2ulong(data->ip, sizeof(data->ip));
+	uint16_t port = (uint16_t)hex2ulong(data->port, sizeof(data->port));
+	uint8_t address = (uint8_t)hex2ulong(data->address, sizeof(data->address));
+	uint16_t reg = (uint16_t)hex2ulong(turnon ? data->register_on : data->register_off, sizeof(data->register_on));
+	uint16_t onoff = (uint16_t)hex2ulong(turnon ? data->data_on : data->data_off, sizeof(data->data_on));
+
+	send_rs485_command(ip4, port, address, reg, onoff);
+#endif
 }
 
 /** Prepare factory reset */
