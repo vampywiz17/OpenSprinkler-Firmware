@@ -224,6 +224,8 @@ void sensor_api_init(boolean detect_boards) {
       modbus_rtu_set_rts(ctx, MODBUS_RTU_RTS_NONE); // we use auto RTS function by the HAT
       modbus_set_response_timeout(ctx, 1, 500000); // 1.5s
       if (modbus_connect(ctx) == -1) {
+        DEBUG_PRINT(F("Connection failed: "));
+        DEBUG_PRINTLN(modbus_strerror(errno));        
         modbus_free(ctx);
       } else {
         n++;
@@ -2883,7 +2885,7 @@ void monitor_load() {
   if (!file_exists(MONITOR_FILENAME)) return;
   DEBUG_PRINT(F("monitor_load_size: "));
   DEBUG_PRINTLN(file_size(MONITOR_FILENAME));
-  DEBUG_PRINT(F("monitor_load_store_size: "))
+  DEBUG_PRINT(F("monitor_load_store_size: "));
   DEBUG_PRINTLN(MONITOR_STORE_SIZE);
   if (file_size(MONITOR_FILENAME) % MONITOR_STORE_SIZE != 0) return;
   
