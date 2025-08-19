@@ -7,6 +7,8 @@ using ArduinoJson::DeserializationError;
 /**
  * @brief FYTA Public API Client
  * https://fyta-io.notion.site/FYTA-Public-API-d2f4c30306f74504924c9a40402a3afd
+ *
+ * httplib: https://github.com/yhirose/cpp-httplib
  * 
  */
 bool FytaApi::authenticate() {
@@ -42,15 +44,16 @@ bool FytaApi::authenticate() {
             authToken = responseDoc["token"].as<String>();
             return true;
         }
+    }
 #endif
     return false;
 }
 
 // Query sensor values
 bool FytaApi::getSensorData(int plantId, JsonDocument& doc) {
-    if (authToken.isEmpty()) return false;
 
 #if defined(ESP8266)
+    if (authToken.isEmpty()) return false;
     HTTPClient http;
     String url = FYTA_URL_USER_PLANT2 + String(plantId);
     http.begin(*client, url);
@@ -64,10 +67,14 @@ bool FytaApi::getSensorData(int plantId, JsonDocument& doc) {
     }
     http.end();
 #elif defined(OSPI)
+    if (authToken.empty()) return false;
     httplib::Client http(FYTA_URL, 443);
-    http.set_bearer_token(authToken.c_str());
-    http.set_header("Content-Type", "application/json");
-    res = http.Get(FYTA_URL_USER_PLANT + "/" + std::to_string(plantId));
+    httplib::Headers headers = {
+        {"Authorization", "Bearer " + authToken},
+        {"Content-Type", "application/json"}
+    };
+    std::string url = FYTA_URL_USER_PLANT2 + std::to_string(plantId);
+    auto res = http.Get(url, headers);
     if (res && res->status == 200) {
         DeserializationError error = deserializeJson(doc, res->body);
         if (!error) {
@@ -79,9 +86,9 @@ bool FytaApi::getSensorData(int plantId, JsonDocument& doc) {
 }
 
 bool FytaApi::getPlantList(JsonDocument& doc) {
-    if (authToken.isEmpty()) return false;      
 
 #if defined(ESP8266)
+    if (authToken.isEmpty()) return false;      
     HTTPClient http;
     http.begin(*client, FYTA_URL_USER_PLANT);
     http.addHeader("Authorization", "Bearer " + authToken);
@@ -97,10 +104,13 @@ bool FytaApi::getPlantList(JsonDocument& doc) {
     }
     http.end();
 #elif defined(OSPI)
+    if (authToken.empty()) return false;      
     httplib::Client http(FYTA_URL, 443);
-    http.set_bearer_token(authToken.c_str());   
-    http.set_header("Content-Type", "application/json");
-    auto res = http.Get(FYTA_URL_USER_PLANT);  
+    httplib::Headers headers = {
+        {"Authorization", "Bearer " + authToken},
+        {"Content-Type", "application/json"}
+    };
+    auto res = http.Get(FYTA_URL_USER_PLANT, headers);
     if (res && res->status == 200) {
         DeserializationError error = deserializeJson(doc, res->body);
         if (!error && doc.containsKey("plants")) {

@@ -2920,7 +2920,7 @@ void monitor_load() {
   if (!file_exists(MONITOR_FILENAME)) return;
   DEBUG_PRINT(F("monitor_load_size: "));
   DEBUG_PRINTLN(file_size(MONITOR_FILENAME));
-  DEBUG_PRINT(F("monitor_load_store_size: "))
+  DEBUG_PRINT(F("monitor_load_store_size: "));
   DEBUG_PRINTLN(MONITOR_STORE_SIZE);
   if (file_size(MONITOR_FILENAME) % MONITOR_STORE_SIZE != 0) return;
   

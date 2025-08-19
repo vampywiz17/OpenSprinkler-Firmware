@@ -268,8 +268,8 @@ using socklen_t = int;
 #include <unistd.h>
 
 using socket_t = int;
-#ifndef INVALID_SOCKET
-#define INVALID_SOCKET (-1)
+#ifndef H_INVALID_SOCKET
+#define H_INVALID_SOCKET (-1)
 #endif
 #endif //_WIN32
 
@@ -1166,7 +1166,7 @@ protected:
                        bool &connection_closed,
                        const std::function<void(Request &)> &setup_request);
 
-  std::atomic<socket_t> svr_sock_{INVALID_SOCKET};
+  std::atomic<socket_t> svr_sock_{H_INVALID_SOCKET};
   size_t keep_alive_max_count_ = CPPHTTPLIB_KEEPALIVE_MAX_COUNT;
   time_t keep_alive_timeout_sec_ = CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND;
   time_t read_timeout_sec_ = CPPHTTPLIB_SERVER_READ_TIMEOUT_SECOND;
@@ -1562,12 +1562,12 @@ public:
 
 protected:
   struct Socket {
-    socket_t sock = INVALID_SOCKET;
+    socket_t sock = H_INVALID_SOCKET;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
     SSL *ssl = nullptr;
 #endif
 
-    bool is_open() const { return sock != INVALID_SOCKET; }
+    bool is_open() const { return sock != H_INVALID_SOCKET; }
   };
 
   virtual bool create_and_connect_socket(Socket &socket, Error &error);
@@ -3426,7 +3426,7 @@ inline bool keep_alive(const std::atomic<socket_t> &svr_sock, socket_t sock,
   const auto timeout = seconds{keep_alive_timeout_sec};
 
   while (true) {
-    if (svr_sock == INVALID_SOCKET) {
+    if (svr_sock == H_INVALID_SOCKET) {
       break; // Server socket is closed
     }
 
@@ -3563,7 +3563,7 @@ inline int getaddrinfo_with_timeout(const char *node, const char *service,
     }
 
     DWORD bytes_returned;
-    if (!::GetOverlappedResult((HANDLE)INVALID_SOCKET, &overlapped,
+    if (!::GetOverlappedResult((HANDLE)H_INVALID_SOCKET, &overlapped,
                                &bytes_returned, FALSE)) {
       ::CloseHandle(event);
       return ::WSAGetLastError();
@@ -3863,7 +3863,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
 #if !defined(_WIN32) || defined(CPPHTTPLIB_HAVE_AFUNIX_H)
   if (hints.ai_family == AF_UNIX) {
     const auto addrlen = host.length();
-    if (addrlen > sizeof(sockaddr_un::sun_path)) { return INVALID_SOCKET; }
+    if (addrlen > sizeof(sockaddr_un::sun_path)) { return H_INVALID_SOCKET; }
 
 #ifdef SOCK_CLOEXEC
     auto sock = socket(hints.ai_family, hints.ai_socktype | SOCK_CLOEXEC,
@@ -3872,7 +3872,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
     auto sock = socket(hints.ai_family, hints.ai_socktype, hints.ai_protocol);
 #endif
 
-    if (sock != INVALID_SOCKET) {
+    if (sock != H_INVALID_SOCKET) {
       sockaddr_un addr{};
       addr.sun_family = AF_UNIX;
 
@@ -3900,7 +3900,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
       bool dummy;
       if (!bind_or_connect(sock, hints, dummy)) {
         close_socket(sock);
-        sock = INVALID_SOCKET;
+        sock = H_INVALID_SOCKET;
       }
     }
     return sock;
@@ -3914,7 +3914,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
 #if defined __linux__ && !defined __ANDROID__
     res_init();
 #endif
-    return INVALID_SOCKET;
+    return H_INVALID_SOCKET;
   }
   auto se = detail::scope_exit([&] { freeaddrinfo(result); });
 
@@ -3938,7 +3938,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
      * SP1, and later
      *
      */
-    if (sock == INVALID_SOCKET) {
+    if (sock == H_INVALID_SOCKET) {
       sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
     }
 #else
@@ -3951,7 +3951,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
 #endif
 
 #endif
-    if (sock == INVALID_SOCKET) { continue; }
+    if (sock == H_INVALID_SOCKET) { continue; }
 
 #if !defined _WIN32 && !defined SOCK_CLOEXEC
     if (fcntl(sock, F_SETFD, FD_CLOEXEC) == -1) {
@@ -3977,7 +3977,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
     if (quit) { break; }
   }
 
-  return INVALID_SOCKET;
+  return H_INVALID_SOCKET;
 }
 
 inline void set_nonblocking(socket_t sock, bool nonblocking) {
@@ -4119,7 +4119,7 @@ inline socket_t create_client_socket(
       },
       connection_timeout_sec); // Pass DNS timeout
 
-  if (sock != INVALID_SOCKET) {
+  if (sock != H_INVALID_SOCKET) {
     error = Error::Success;
   } else {
     if (error == Error::Success) { error = Error::Connection; }
@@ -7525,8 +7525,8 @@ inline void Server::wait_until_ready() const {
 
 inline void Server::stop() {
   if (is_running_) {
-    assert(svr_sock_ != INVALID_SOCKET);
-    std::atomic<socket_t> sock(svr_sock_.exchange(INVALID_SOCKET));
+    assert(svr_sock_ != H_INVALID_SOCKET);
+    std::atomic<socket_t> sock(svr_sock_.exchange(H_INVALID_SOCKET));
     detail::shutdown_socket(sock);
     detail::close_socket(sock);
   }
@@ -7685,7 +7685,7 @@ Server::write_content_with_provider(Stream &strm, const Request &req,
                                     Response &res, const std::string &boundary,
                                     const std::string &content_type) {
   auto is_shutting_down = [this]() {
-    return this->svr_sock_ == INVALID_SOCKET;
+    return this->svr_sock_ == H_INVALID_SOCKET;
   };
 
   if (res.content_length_ > 0) {
@@ -7921,7 +7921,7 @@ inline int Server::bind_internal(const std::string &host, int port,
   if (!is_valid()) { return -1; }
 
   svr_sock_ = create_server_socket(host, port, socket_flags, socket_options_);
-  if (svr_sock_ == INVALID_SOCKET) { return -1; }
+  if (svr_sock_ == H_INVALID_SOCKET) { return -1; }
 
   if (port == 0) {
     struct sockaddr_storage addr;
@@ -7954,7 +7954,7 @@ inline bool Server::listen_internal() {
   {
     std::unique_ptr<TaskQueue> task_queue(new_task_queue());
 
-    while (svr_sock_ != INVALID_SOCKET) {
+    while (svr_sock_ != H_INVALID_SOCKET) {
 #ifndef _WIN32
       if (idle_interval_sec_ > 0 || idle_interval_usec_ > 0) {
 #endif
@@ -7978,7 +7978,7 @@ inline bool Server::listen_internal() {
       socket_t sock = accept(svr_sock_, nullptr, nullptr);
 #endif
 
-      if (sock == INVALID_SOCKET) {
+      if (sock == H_INVALID_SOCKET) {
         if (errno == EMFILE) {
           // The per-process limit of open file descriptors has been reached.
           // Try to accept new connections after a short sleep.
@@ -7987,7 +7987,7 @@ inline bool Server::listen_internal() {
         } else if (errno == EINTR || errno == EAGAIN) {
           continue;
         }
-        if (svr_sock_ != INVALID_SOCKET) {
+        if (svr_sock_ != H_INVALID_SOCKET) {
           detail::close_socket(svr_sock_);
           ret = false;
           output_error_log(Error::Connection, nullptr);
@@ -8605,7 +8605,7 @@ inline socket_t ClientImpl::create_client_socket(Error &error) const {
 inline bool ClientImpl::create_and_connect_socket(Socket &socket,
                                                   Error &error) {
   auto sock = create_client_socket(error);
-  if (sock == INVALID_SOCKET) { return false; }
+  if (sock == H_INVALID_SOCKET) { return false; }
   socket.sock = sock;
   return true;
 }
@@ -8619,7 +8619,7 @@ inline void ClientImpl::shutdown_ssl(Socket & /*socket*/,
 }
 
 inline void ClientImpl::shutdown_socket(Socket &socket) const {
-  if (socket.sock == INVALID_SOCKET) { return; }
+  if (socket.sock == H_INVALID_SOCKET) { return; }
   detail::shutdown_socket(socket.sock);
 }
 
@@ -8637,9 +8637,9 @@ inline void ClientImpl::close_socket(Socket &socket) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
   assert(socket.ssl == nullptr);
 #endif
-  if (socket.sock == INVALID_SOCKET) { return; }
+  if (socket.sock == H_INVALID_SOCKET) { return; }
   detail::close_socket(socket.sock);
-  socket.sock = INVALID_SOCKET;
+  socket.sock = H_INVALID_SOCKET;
 }
 
 inline bool ClientImpl::read_response_line(Stream &strm, const Request &req,
@@ -11115,7 +11115,7 @@ inline void SSLClient::shutdown_ssl(Socket &socket, bool shutdown_gracefully) {
 
 inline void SSLClient::shutdown_ssl_impl(Socket &socket,
                                          bool shutdown_gracefully) {
-  if (socket.sock == INVALID_SOCKET) {
+  if (socket.sock == H_INVALID_SOCKET) {
     assert(socket.ssl == nullptr);
     return;
   }

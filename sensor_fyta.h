@@ -48,7 +48,7 @@ public:
     bool getSensorData(int plantId, JsonDocument& doc);
     // Get plant list
     bool getPlantList(JsonDocument& doc);
-   private:
+private:
     void allocClient();
     void freeClient();
     String userEmail;
