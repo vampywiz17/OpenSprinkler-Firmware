@@ -1,7 +1,6 @@
 #include "sensor_fyta.h"
 
 using ArduinoJson::JsonDocument;
-using ArduinoJson::StaticJsonDocument;
 using ArduinoJson::DeserializationError;
 
 /**

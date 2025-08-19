@@ -30,6 +30,8 @@
 #include "main.h"
 #include "sensors.h"
 #include "osinfluxdb.h"
+#include "ArduinoJson.hpp"
+#include "sensor_fyta.h"
 
 // External variables defined in main ion file
 #if defined(USE_OTF)
@@ -64,6 +66,11 @@
 	#include <stdlib.h>
 	#include "etherport.h"
 #endif
+
+using ArduinoJson::JsonDocument;
+using ArduinoJson::DeserializationError;
+using ArduinoJson::JsonArray;
+using ArduinoJson::JsonVariant;
 
 extern char ether_buffer[];
 extern char tmp_buffer[];
@@ -1305,6 +1312,9 @@ void server_json_controller_main(OTF_PARAMS_DEF) {
 	bfill.emit_p(PSTR("\"email\":{$O},"), SOPT_EMAIL_OPTS);
 #endif
 
+	//FYTA Options
+	bfill.emit_p(PSTR("\"fyta\":{$O},"), SOPT_FYTA_OPTS);
+
 #if defined(ARDUINO)
 	if(os.status.has_curr_sense) {
 		uint16_t current = os.read_current();
@@ -1709,6 +1719,17 @@ void server_change_options(OTF_PARAMS_DEF)
 		#endif
 		strReplaceQuoteBackslash(tmp_buffer);
 		os.sopt_save(SOPT_DEVICE_NAME, tmp_buffer);
+	}
+
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("fyta"), true &keyfound)) {
+		#if !defined(USE_OTF)
+		urlDecode(tmp_buffer);
+		#endif
+		strReplaceQuoteBackslash(tmp_buffer);
+		os.sopt_save(SOPT_FYTA_OPTS, tmp_buffer);
+	} else if (keyfound) {
+		tmp_buffer[0]=0;
+		os.sopt_save(SOPT_FYTA_OPTS, tmp_buffer);
 	}
 
 	// if not using NTP and manually setting time
@@ -2966,6 +2987,56 @@ void server_sensorlog_clear(OTF_PARAMS_DEF) {
 	handle_return(HTML_OK);
 }
 
+void server_fyta_query_plants(OTF_PARAMS_DEF) {
+#if defined(USE_OTF)
+	if(!process_password(OTF_PARAMS)) return;
+#else
+	char *p = get_buffer;
+#endif
+
+	DEBUG_PRINTLN(F("server_fyta_query_plants"));
+
+#if defined(USE_OTF)
+	// as the log data can be large, we will use ESP8266's sendContent function to
+	// send multiple packets of data, instead of the standard way of using send().
+	rewind_ether_buffer();
+	print_header(OTF_PARAMS);
+#else
+	print_header();
+#endif
+
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, os.sopt_load(SOPT_FYTA_OPTS));
+    if (error || !doc.containsKey("email") || !doc.containsKey("password")) {
+      DEBUG_PRINTLN(F("No fyta credentials found!"));
+	  handle_return(HTML_OK);
+	  return;
+    }
+
+    FytaApi fytaapi(doc["email"], doc["password"]);
+    
+    if (!fytaapi.getPlantList(doc)) {
+      DEBUG_PRINTLN(F("No fyta plants found!"));
+	  handle_return(HTML_OK);
+	  return;
+    }
+
+	bfill.emit_p(PSTR("{\"plants\":["));
+	bool first = true;
+	for (JsonVariant plant : doc["plants"].as<JsonArray>()) {
+		if (plant.containsKey("sensor") && plant["sensor"]["has_sensor"].as<bool>()) {
+			if (first) first = false; else bfill.emit_p(PSTR(","));
+			bfill.emit_p(PSTR("{\"id\":\"$S\",\"nickname\":\"$S\"}"),
+				plant["id"].as<const char*>(),
+				plant["nickname"].as<const char*>());
+		}
+	}
+	bfill.emit_p(PSTR("]}"));
+
+	handle_return(HTML_OK);
+	DEBUG_PRINTLN(F("server_fyta_query_plants done"));	
+}
+
 /**
  * mt
  * supported monitor types
@@ -4059,6 +4130,7 @@ const char _url_keys[] PROGMEM =
 	"mc"
 	"ml"
 	"mt"
+	"fy"
 #if defined(ARDUINO)
 	//"ff"
 #endif
@@ -4111,6 +4183,7 @@ URLHandler urls[] = {
 	server_monitor_config, // mc
 	server_monitor_list, // ml
 	server_monitor_types, // mt
+	server_fyta_query_plants, // fy
 	//server_fill_files,
 };
 
