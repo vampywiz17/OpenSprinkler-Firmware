@@ -1,7 +1,9 @@
 #include "sensor_fyta.h"
+#if defined(ESP8266)
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecure.h>
-#include <ArduinoJson.hpp>
+#endif
+#include "ArduinoJson.hpp"
 
 using ArduinoJson::JsonDocument;
 using ArduinoJson::StaticJsonDocument;

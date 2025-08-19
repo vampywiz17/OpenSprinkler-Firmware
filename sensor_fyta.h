@@ -1,12 +1,7 @@
 #ifndef _SENSOR_FYTA_H
 #define _SENSOR_FYTA_H
 
-#include <ArduinoJson.hpp>
-#if defined(ESP8266)
-#include <WiFiClient.h>
-#else
-#include <EthernetClient.h>
-#endif  
+#include "OpenSprinkler.h"
 
 using ArduinoJson::JsonDocument;
 using ArduinoJson::DeserializationError;
