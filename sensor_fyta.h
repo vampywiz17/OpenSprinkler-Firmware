@@ -1,10 +1,30 @@
 #ifndef _SENSOR_FYTA_H
 #define _SENSOR_FYTA_H
 
+#if defined(ESP8266)
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
+#elif defined(OSPI)
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#include "httplib.h"
+#endif
+
+#include "ArduinoJson.hpp"
 #include "OpenSprinkler.h"
 
 using ArduinoJson::JsonDocument;
 using ArduinoJson::DeserializationError;
+
+#define FYTA_URL "https://web.fyta.de"
+#if defined(ESP8266)
+#define FYTA_URL_LOGIN "https://web.fyta.de/api/auth/login"
+#define FYTA_URL_USER_PLANT "https://web.fyta.de/api/user-plant"
+#define FYTA_URL_USER_PLANT2 "https://web.fyta.de/api/user-plant/"
+#elif defined(OSPI)
+#define FYTA_URL_LOGIN "/api/auth/login"
+#define FYTA_URL_USER_PLANT "/api/user-plant"
+#define FYTA_URL_USER_PLANT2 "/api/user-plant/"
+#endif
 
 /**
  * @brief FYTA Public API Client
@@ -36,8 +56,6 @@ public:
     String authToken;
 #if defined(ESP8266)
     WiFiClient *client;
-#else
-    EthernetClient *client;
 #endif
 };
 

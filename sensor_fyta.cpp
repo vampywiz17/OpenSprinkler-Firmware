@@ -1,9 +1,4 @@
 #include "sensor_fyta.h"
-#if defined(ESP8266)
-#include <ESP8266HTTPClient.h>
-#include <WiFiClientSecure.h>
-#endif
-#include "ArduinoJson.hpp"
 
 using ArduinoJson::JsonDocument;
 using ArduinoJson::StaticJsonDocument;
@@ -15,10 +10,6 @@ using ArduinoJson::DeserializationError;
  * 
  */
 bool FytaApi::authenticate() {
-    HTTPClient http;
-    String url = "https://web.fyta.de/api/auth/login";
-    http.begin(*client, url);
-    http.addHeader("Content-Type", "application/json");
     JsonDocument payload;
     payload["email"] = userEmail;
     payload["password"] = userPassword;
@@ -26,6 +17,10 @@ bool FytaApi::authenticate() {
     serializeJson(payload, requestBody, sizeof(requestBody));
     authToken = "";
 
+#if defined(ESP8266)
+    HTTPClient http;
+    http.begin(*client, FYTA_URL_LOGIN);
+    http.addHeader("Content-Type", "application/json");
     int res = http.POST(requestBody);
     if (res == 200) {
         JsonDocument responseDoc;
@@ -37,18 +32,30 @@ bool FytaApi::authenticate() {
         }
     }
     http.end();
+#elif defined(OSPI)
+    httplib::Client http(FYTA_URL, 443);
+    auto res = http.Post(FYTA_URL_LOGIN, requestBody, "application/json");
+    if (res && res->status == 200) {
+        JsonDocument responseDoc;
+        DeserializationError error = deserializeJson(responseDoc, res->body);   
+        if (!error && responseDoc.containsKey("token")) {
+            authToken = responseDoc["token"].as<String>();
+            return true;
+        }
+#endif
     return false;
 }
 
 // Query sensor values
 bool FytaApi::getSensorData(int plantId, JsonDocument& doc) {
     if (authToken.isEmpty()) return false;
+
+#if defined(ESP8266)
     HTTPClient http;
-    String url = "https://web.fyta.de/api/user-plant/" + plantId;
+    String url = FYTA_URL_USER_PLANT2 + String(plantId);
     http.begin(*client, url);
     http.addHeader("Authorization", "Bearer " + authToken);
     http.addHeader("Content-Type", "application/json");
-
     int httpCode = http.GET();
     if (httpCode == 200) {
         DeserializationError error = deserializeJson(doc, http.getString());
@@ -56,14 +63,27 @@ bool FytaApi::getSensorData(int plantId, JsonDocument& doc) {
         return !error;
     }
     http.end();
+#elif defined(OSPI)
+    httplib::Client http(FYTA_URL, 443);
+    http.set_bearer_token(authToken.c_str());
+    http.set_header("Content-Type", "application/json");
+    res = http.Get(FYTA_URL_USER_PLANT + "/" + std::to_string(plantId));
+    if (res && res->status == 200) {
+        DeserializationError error = deserializeJson(doc, res->body);
+        if (!error) {
+            return true;
+        }
+    }
+#endif
     return false;
 }
 
 bool FytaApi::getPlantList(JsonDocument& doc) {
     if (authToken.isEmpty()) return false;      
+
+#if defined(ESP8266)
     HTTPClient http;
-    String url = "https://web.fyta.de/api/user-plant";
-    http.begin(*client, url);
+    http.begin(*client, FYTA_URL_USER_PLANT);
     http.addHeader("Authorization", "Bearer " + authToken);
     http.addHeader("Content-Type", "application/json");
 
@@ -76,6 +96,18 @@ bool FytaApi::getPlantList(JsonDocument& doc) {
         }
     }
     http.end();
+#elif defined(OSPI)
+    httplib::Client http(FYTA_URL, 443);
+    http.set_bearer_token(authToken.c_str());   
+    http.set_header("Content-Type", "application/json");
+    auto res = http.Get(FYTA_URL_USER_PLANT);  
+    if (res && res->status == 200) {
+        DeserializationError error = deserializeJson(doc, res->body);
+        if (!error && doc.containsKey("plants")) {
+            return true;
+        }
+    }
+#endif
     return false;
 }
 
@@ -85,14 +117,14 @@ void FytaApi::allocClient() {
     _c->setInsecure();
     _c->setBufferSizes(512, 512); 
     client = _c;
-#else
-	EthernetClient *client = new EthernetClientSsl();
 #endif   
 }
 
 void FytaApi::freeClient() {
+#if defined(ESP8266)
     if (client) {
         delete client;
         client = nullptr;
     }   
+#endif
 }
