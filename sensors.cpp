@@ -1694,14 +1694,24 @@ int read_sensor_fyta(Sensor_t *sensor, ulong time) {
       sensor->flags.data_ok = false;
       return HTTP_RQT_NOT_RECEIVED;
     }
+    if (!doc.containsKey("plant")) {
+      sensor->flags.data_ok = false;
+      return HTTP_RQT_NOT_RECEIVED;
+    }
 
+    auto plant = doc["plant"];
+
+    int unit = plant["temperature_unit"]; //1=Celsius, 2=Fahrenheit
+    
     if (sensor->type == SENSOR_FYTA_TEMPERATURE) {
-      sensor->last_data = doc["measurements"]["temperature"]["values"]["current"].as<double>();
+      sensor->last_data = plant["measurements"]["temperature"]["values"]["current"].as<double>();
+      if (unit == 1) sensor->unitid = UNIT_DEGREE;
+      else if (unit == 2) sensor->unitid = UNIT_FAHRENHEIT;
       sensor->flags.data_ok = true;
       return HTTP_RQT_SUCCESS;
     }
     else if (sensor->type == SENSOR_FYTA_MOISTURE) {
-      sensor->last_data = doc["measurements"]["moisture"]["values"]["current"].as<double>();
+      sensor->last_data = plant["measurements"]["moisture"]["values"]["current"].as<double>();
       sensor->flags.data_ok = true;
       return HTTP_RQT_SUCCESS;
     }
