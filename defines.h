@@ -36,7 +36,7 @@ typedef unsigned long ulong;
 														// if this number is different from the one stored in non-volatile memory
 														// a device reset will be automatically triggered
 
-#define OS_FW_MINOR      180  // Firmware minor version
+#define OS_FW_MINOR      181  // Firmware minor version
 
 /** Hardware version base numbers */
 #define OS_HW_VERSION_BASE   0x00 // OpenSprinkler
@@ -300,6 +300,7 @@ enum {
 	SOPT_DEVICE_NAME,
 	SOPT_STA_BSSID_CHL, // wifi extra info: bssid and channel
 	SOPT_EMAIL_OPTS,
+	SOPT_FYTA_OPTS,
 	NUM_SOPTS // total number of string options
 };
 

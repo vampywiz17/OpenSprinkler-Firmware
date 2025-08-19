@@ -90,6 +90,9 @@ extern "C" {
 #define SENSOR_OSPI_ANALOG_SMT50_MOIS   52  // Old OSPi analog input - SMT50 VWC [%] = (U * 50) : 3
 #define SENSOR_OSPI_ANALOG_SMT50_TEMP   53  // Old OSPi analog input - SMT50 T [°C] = (U – 0,5) * 100
 #define SENSOR_OSPI_INTERNAL_TEMP       54  // Internal OSPI Temperature
+
+#define SENSOR_FYTA_MOISTURE            60  // FYTA moisture sensor
+#define SENSOR_FYTA_TEMPERATURE         61  // FYTA temperature sensor
  
 #define SENSOR_MQTT                     90  // subscribe to a MQTT server and query a value
 
@@ -460,5 +463,7 @@ boolean send_rs485_command(uint32_t ip, uint16_t port, uint8_t address, uint16_t
 ulong diskFree();
 bool checkDiskFree();  // true: disk space Ok, false: Out of disk space
 #endif
+
+void replace_pid(uint old_pid, uint new_pid);
 
 #endif  // _SENSORS_H

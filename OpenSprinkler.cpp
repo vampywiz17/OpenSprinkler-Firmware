@@ -2036,14 +2036,13 @@ int8_t OpenSprinkler::send_http_request(const char* server, uint16_t port, char*
 			free_tmp_memory();
 			WiFiClientSecure *_c = new WiFiClientSecure();
 			_c->setInsecure();
-  		bool mfln = _c->probeMaxFragmentLength(server, port, 512);
-  		DEBUG_PRINTF("MFLN supported: %s\n", mfln ? "yes" : "no");
-  		if (mfln) {
+  			bool mfln = _c->probeMaxFragmentLength(server, port, 512);
+  			DEBUG_PRINTF("MFLN supported: %s\n", mfln ? "yes" : "no");
+  			if (mfln) {
 				_c->setBufferSizes(512, 512); 
 			} else {
 				_c->setBufferSizes(2048, 2048);
 			}
-			restore_tmp_memory();
 			client = _c;
 		} else {
 			client = new WiFiClient();
@@ -2069,6 +2068,7 @@ int8_t OpenSprinkler::send_http_request(const char* server, uint16_t port, char*
 		DEBUG_PRINTLN(F("failed."));
 		client->stop();
 		delete client;
+		if (usessl) restore_tmp_memory();
 		return HTTP_RQT_CONNECT_ERR;
 	}
 #else
@@ -2132,6 +2132,9 @@ int8_t OpenSprinkler::send_http_request(const char* server, uint16_t port, char*
 	ether_buffer[pos]=0; // properly end buffer with 0
 	client->stop();
 	delete client;
+#if defined(ESP8266)
+	if (usessl) restore_tmp_memory();
+#endif
 	if(strlen(ether_buffer)==0) return HTTP_RQT_EMPTY_RETURN;
 	if(callback) callback(ether_buffer);
 	return HTTP_RQT_SUCCESS;

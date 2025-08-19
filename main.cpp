@@ -1518,6 +1518,7 @@ void manual_start_program(unsigned char pid, unsigned char uwt) {
 	unsigned char sid, bid, s;
 	if ((pid>0)&&(pid<255)) {
 		pd.read(pid-1, &prog);
+		if (uwt == 255) uwt = prog.use_weather;
 		notif.add(NOTIFY_PROGRAM_SCHED, pid-1, uwt?os.iopts[IOPT_WATER_PERCENTAGE]:100, 1);
 	}
 	for(sid=0;sid<os.nstations;sid++) {

@@ -3483,6 +3483,9 @@ static const int sensor_types[] = {
 #if defined(OSPI)
     SENSOR_OSPI_INTERNAL_TEMP,
 #endif
+    SENSOR_FYTA_MOISTURE,
+    SENSOR_FYTA_TEMPERATURE,
+	
 	SENSOR_MQTT,
 	SENSOR_REMOTE,
 	SENSOR_WEATHER_TEMP_F,
@@ -3533,6 +3536,9 @@ static const char* sensor_names[] = {
 #if defined(OSPI)
     "Internal Raspbery Pi temperature",
 #endif
+	"FYTA moisture sensor",
+	"FYTA temperature sensor",
+
 	"MQTT subscription",
 	"Remote opensprinkler sensor",
 	"Weather data - temperature (°F)",

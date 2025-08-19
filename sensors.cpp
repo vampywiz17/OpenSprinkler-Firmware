@@ -38,6 +38,7 @@
 #include "opensprinkler_server.h"
 #include "program.h"
 #include "sensor_mqtt.h"
+#include "sensor_fyta.h"
 #include "utils.h"
 #include "weather.h"
 #include "osinfluxdb.h"
@@ -1674,6 +1675,39 @@ int read_internal_raspi(Sensor_t *sensor, ulong time) {
 	return HTTP_RQT_SUCCESS;
 }
 #endif
+
+int read_sensor_fyta(Sensor_t *sensor, ulong time) {
+  if (time >= sensor->last_read + sensor->read_interval) {
+    sensor->last_read = time;
+
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, os.sopt_load(SOPT_FYTA_OPTS));
+    if (error) {
+      DEBUG_PRINTLN(F("No fyta credentials found!"));
+      sensor->flags.data_ok = false;
+      return HTTP_RQT_NOT_RECEIVED;
+    }
+
+    FytaApi fytaapi(doc["email"], doc["password"]);
+    
+    if (!fytaapi.getSensorData(sensor->id, doc)) {
+      sensor->flags.data_ok = false;
+      return HTTP_RQT_NOT_RECEIVED;
+    }
+
+    if (sensor->type == SENSOR_FYTA_TEMPERATURE) {
+      sensor->last_data = doc["measurements"]["temperature"]["values"]["current"].as<double>();
+      sensor->flags.data_ok = true;
+      return HTTP_RQT_SUCCESS;
+    }
+    else if (sensor->type == SENSOR_FYTA_MOISTURE) {
+      sensor->last_data = doc["measurements"]["moisture"]["values"]["current"].as<double>();
+      sensor->flags.data_ok = true;
+      return HTTP_RQT_SUCCESS;
+    }
+  }
+  return HTTP_RQT_NOT_RECEIVED;
+}
 /**
  * read a sensor
  */
@@ -1691,7 +1725,10 @@ int read_sensor(Sensor_t *sensor, ulong time) {
       sensor->last_read = time;
       if (sensor->ip) return read_sensor_ip(sensor);
       return read_sensor_rs485(sensor);
-      break;
+
+    case SENSOR_FYTA_MOISTURE:
+    case SENSOR_FYTA_TEMPERATURE:
+      return read_sensor_fyta(sensor, time);
 
 #if defined(ARDUINO)
 #if defined(ESP8266)
@@ -2674,7 +2711,7 @@ void GetSensorWeatherEto() {
     char buf[20];
     char *s = strstr(ether_buffer, "\"eto\":");
     if (s && extract(s, buf, sizeof(buf))) {
-      current_eto = atof(buf);
+      current_eto = atof(buf) * 25.4;  // convert to mm
     }
     s = strstr(ether_buffer, "\"radiation\":");
     if (s && extract(s, buf, sizeof(buf))) {
@@ -3290,3 +3327,29 @@ void check_monitors() {
     monidx++;
   }
 }
+
+void replace_pid(uint old_pid, uint new_pid) {
+  Monitor_t *mon = monitors;
+  while (mon) {
+    if (mon->prog == old_pid) {
+      DEBUG_PRINT(F("replace_pid: "));
+      DEBUG_PRINT(old_pid);
+      DEBUG_PRINT(F(" with "));
+      DEBUG_PRINTLN(new_pid);
+      mon->prog = new_pid;
+    }
+    mon = mon->next;
+  }
+  ProgSensorAdjust_t *psa = progSensorAdjusts;
+  while (psa) {
+    if (psa->prog == old_pid) {
+      DEBUG_PRINT(F("replace_pid psa: "));
+      DEBUG_PRINT(old_pid);
+      DEBUG_PRINT(F(" with "));
+      DEBUG_PRINTLN(new_pid);
+      psa->prog = new_pid;
+    }
+    psa = psa->next;
+  }
+  sensor_save_all();
+} 
