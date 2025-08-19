@@ -1354,7 +1354,7 @@ int read_sensor_rs485(Sensor_t *sensor) {
   return HTTP_RQT_NOT_RECEIVED;
 }
 
-boolean send_rs485_command(uint32_t ip, uint16_t port, uint8_t address, uint16_t reg,uint16_t data) {
+boolean send_rs485_command(uint32_t ip, uint16_t port, uint8_t address, uint16_t reg,uint16_t data, bool isbit) {
 #if defined(ARDUINO)
 
   Client *client;
@@ -1410,11 +1410,16 @@ boolean send_rs485_command(uint32_t ip, uint16_t port, uint8_t address, uint16_t
   buffer[4] = 0;
   buffer[5] = 6;  // len
   buffer[6] = address;  // Modbus ID
-  buffer[7] = 0x06;        // Write Registers
+  buffer[7] = isbit?0x05:0x06;        // Write Registers
   buffer[8] = reg >> 8;  // high byte of register address
   buffer[9] = reg && 0xFF;  // low byte
-  buffer[10] = data >> 8;  // high byte
-  buffer[11] = data && 0xFF;  // low byte
+  if (isbit) {
+    buffer[10] = data?0xFF:0x00;
+    buffer[11] = 0x00;
+  } else {
+    buffer[10] = data >> 8;  // high byte
+    buffer[11] = data && 0xFF;  // low byte
+  }
 
   client->write(buffer, 12);
 #if defined(ESP8266)
@@ -1469,11 +1474,13 @@ int read_sensor_rs485(Sensor_t *sensor) {
   return HTTP_RQT_NOT_RECEIVED;
 }
 
-boolean send_rs485_command(uint8_t device, uint8_t address, uint16_t reg, uint16_t data) {
+boolean send_rs485_command(uint8_t device, uint8_t address, uint16_t reg, uint16_t data, bool isbit) {
   if (device >= MAX_RS485_DEVICES || !modbusDevs[device])
     return false;
 
   modbus_set_slave(modbusDevs[device], address);
+  if (isbit)
+    return modbus_write_bit(modbusDevs[device], reg, data) > 0;
   return modbus_write_register(modbusDevs[device], reg, data) > 0;
 }
 
