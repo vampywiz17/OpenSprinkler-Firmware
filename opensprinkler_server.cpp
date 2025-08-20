@@ -1313,7 +1313,7 @@ void server_json_controller_main(OTF_PARAMS_DEF) {
 #endif
 
 	//FYTA Options
-	bfill.emit_p(PSTR("\"fyta\":{$O},"), SOPT_FYTA_OPTS);
+	bfill.emit_p(PSTR("\"fyta\":$O,"), SOPT_FYTA_OPTS);
 
 #if defined(ARDUINO)
 	if(os.status.has_curr_sense) {

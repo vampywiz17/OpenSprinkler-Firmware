@@ -180,6 +180,15 @@ void detect_asb_board() {
   }
 }
 
+void fyta_check_opts() {
+
+    file_read_block(SOPTS_FILENAME, tmp_buffer, SOPT_FYTA_OPTS*MAX_SOPTS_SIZE, MAX_SOPTS_SIZE);
+    if (tmp_buffer[0] != '{') {
+      strcpy(tmp_buffer, "{\"email\":\"\",\"password\":\"\"}");
+      file_write_block(SOPTS_FILENAME, tmp_buffer, SOPT_FYTA_OPTS*MAX_SOPTS_SIZE, MAX_SOPTS_SIZE);
+    }
+}
+
 uint16_t get_asb_detected_boards() { return asb_detected_boards; }
 /*
  * init sensor api and load data
@@ -192,6 +201,7 @@ void sensor_api_init(boolean detect_boards) {
   prog_adjust_load();
   sensor_mqtt_init();
   monitor_load();
+  fyta_check_opts();
 #ifndef ESP8266
   //Read rs485 file. Details see below
   std::ifstream file;
