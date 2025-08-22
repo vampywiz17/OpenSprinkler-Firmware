@@ -190,6 +190,54 @@ bool FytaApi::getPlantList(JsonDocument& doc) {
 #endif
 }
 
+bool FytaApi::getPlantThumb(ulong plantId, JsonDocument& doc) {
+    DEBUG_PRINTLN("FYTA getPlantThumb");
+#if defined(ESP8266)
+    if (authToken.isEmpty()) return false;
+    HTTPClient http;
+    DEBUG_PRINTLN(doc["thumb_path"]);
+    http.begin(*client, doc["thumb_path"]);
+    http.addHeader("Authorization", "Bearer " + authToken);
+    http.addHeader("Content-Type", "application/json");
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+        doc["thumb"] = http.getString();
+        http.end();
+        return true;
+    }
+    http.end();
+    return false;
+#elif defined(OSPI)
+    if (authToken.empty()) return false;
+    std::string auth = "Bearer " + authToken;
+    DEBUG_PRINTLN(doc["thumb_path"]);
+    naettReq* req =
+        naettRequest(doc["thumb_path"],
+            naettMethod("GET"),
+            naettHeader("Content-Type", "application/json"),
+            naettHeader("Authorization", auth.c_str()));
+
+    naettRes* res = naettMake(req);
+    while (!naettComplete(res)) {
+        usleep(100 * 1000);
+    }
+
+    int bodyLength = 0;
+    const char* body = (char*)naettGetBody(res, &bodyLength);
+    doc["thumb"] = std::string(body, bodyLength);
+    if (naettGetStatus(res) < 0 || !body || !bodyLength || error) {
+        DEBUG_PRINTLN("FYTA Request failed");
+        naettClose(res);
+        naettFree(req);
+        return false;
+    }
+    DEBUG_PRINTLN("FYTA getSensorData OK");
+    naettClose(res);
+    naettFree(req);
+    return true;
+#endif
+}
+
 void FytaApi::allocClient() {
 #if defined(ESP8266)
     WiFiClientSecure *_c = new WiFiClientSecure();

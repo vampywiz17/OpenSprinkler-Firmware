@@ -3065,18 +3065,30 @@ void server_fyta_query_plants(OTF_PARAMS_DEF) {
 		#if defined(ESP8266)
 			String nickname = plant["nickname"];
 			String scientific_name = plant["scientific_name"];
-			String thumb = plant["plant_origin_path"];
+			String thumb = plant["thumb"];
 		#elif defined(OSPI)
 			string nickname = plant["nickname"];
 			string scientific_name = plant["scientific_name"];
-			string thumb = plant["plant_origin_path"];
+			string thumb = plant["thumb"];
 		#endif
-			bfill.emit_p(PSTR("{\"id\":$L,\"nickname\":\"$S\",\"scientific_name\":\"$S\",\"thumb\":\"$S\"}"),
-				id, nickname.c_str(), scientific_name.c_str(), thumb.c_str());
+			bfill.emit_p(PSTR("{\"id\":$L,\"nickname\":\"$S\",\"scientific_name\":\"$S\",\"thumb\":\""),
+				id, nickname.c_str(), scientific_name.c_str());
+			send_packet(OTF_PARAMS);
+			
+			int len = thumb.length();
+			int pos = 0;
+			const char *c = (char*)thumb.c_str();
+			while (pos < len) {
 
-			if (available_ether_buffer() <=0 ) {
+				int size = len-pos;
+				if (size > ETHER_BUFFER_SIZE)
+					size = ETHER_BUFFER_SIZE;
+				strncpy(ether_buffer, c+pos, size);
+				ether_buffer[size] = 0; // null-terminate
 				send_packet(OTF_PARAMS);
-			}	
+				pos += size;
+			}
+			bfill.emit_p(PSTR("\"}"));
 		}
 	}
 	bfill.emit_p(PSTR("]}"));

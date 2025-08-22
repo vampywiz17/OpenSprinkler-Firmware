@@ -43,6 +43,8 @@ public:
     bool getSensorData(ulong plantId, JsonDocument& doc);
     // Get plant list
     bool getPlantList(JsonDocument& doc);
+    // Get plant thumb
+    bool getPlantThumb(ulong plantId, JsonDocument& doc);
 private:
     void allocClient();
     void freeClient();
