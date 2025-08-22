@@ -3052,14 +3052,24 @@ void server_fyta_query_plants(OTF_PARAMS_DEF) {
 	  return;
     }
 
+    DEBUG_PRINT("found plants: ");
+    DEBUG_PRINTLN(doc["plants"].size());
+
 	bfill.emit_p(PSTR("{\"plants\":["));
 	bool first = true;
 	for (JsonVariant plant : doc["plants"].as<JsonArray>()) {
 		if (plant.containsKey("sensor") && plant["sensor"]["has_sensor"].as<bool>()) {
 			if (first) first = false; else bfill.emit_p(PSTR(","));
-			bfill.emit_p(PSTR("{\"id\":\"$S\",\"nickname\":\"$S\"}"),
-				plant["id"].as<const char*>(),
-				plant["nickname"].as<const char*>());
+			ulong id = plant["id"];
+			string nickname = plant["nickname"];
+			string scientific_name = plant["scientific_name"];
+			string thumb = plant["plant_origin_path"];
+			bfill.emit_p(PSTR("{\"id\":$L,\"nickname\":\"$S\",\"scientific_name\":\"$S\",\"thumb\":\"$S\"}"),
+				id, nickname.c_str(), scientific_name.c_str(), thumb.c_str());
+
+			if (available_ether_buffer() <=0 ) {
+				send_packet(OTF_PARAMS);
+			}	
 		}
 	}
 	bfill.emit_p(PSTR("]}"));

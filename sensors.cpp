@@ -1046,6 +1046,7 @@ void read_all_sensors(boolean online) {
         current_sensor->repeat_read) {
       if (online || (current_sensor->ip == 0 && current_sensor->type != SENSOR_MQTT)) {
         int result = read_sensor(current_sensor, time);
+        if (!current_sensor) return; // when saving sensors, current_sensor is set to null
         if (result == HTTP_RQT_SUCCESS) {
           sensorlog_add(LOG_STD, current_sensor, time);
           push_message(current_sensor);
@@ -1701,9 +1702,18 @@ int read_sensor_fyta(Sensor_t *sensor, ulong time) {
     FytaApi fytaapi(doc["email"], doc["password"]);
     
     if (!fytaapi.getSensorData(sensor->id, doc)) {
+      DEBUG_PRINTLN(F("Fyta Sensor not found!"));
+      DEBUG_PRINTLN(sensor->id);
       sensor->flags.data_ok = false;
       return HTTP_RQT_NOT_RECEIVED;
     }
+
+#if defined(ENABLE_DEBUG)
+    std::string debugOut;
+    serializeJson(doc, debugOut);
+    DEBUG_PRINTLN(debugOut.c_str());
+#endif
+
     if (!doc.containsKey("plant")) {
       sensor->flags.data_ok = false;
       return HTTP_RQT_NOT_RECEIVED;
@@ -1715,13 +1725,26 @@ int read_sensor_fyta(Sensor_t *sensor, ulong time) {
     
     if (sensor->type == SENSOR_FYTA_TEMPERATURE) {
       sensor->last_data = plant["measurements"]["temperature"]["values"]["current"].as<double>();
-      if (unit == 1) sensor->unitid = UNIT_DEGREE;
-      else if (unit == 2) sensor->unitid = UNIT_FAHRENHEIT;
+      if (unit == 1 && sensor->assigned_unitid != UNIT_DEGREE) {
+        sensor->assigned_unitid = UNIT_DEGREE;
+        sensor->unitid = UNIT_DEGREE;
+        sensor_save_all();
+      }
+      else if (unit == 2 && sensor->assigned_unitid != UNIT_FAHRENHEIT) {
+         sensor->assigned_unitid = UNIT_FAHRENHEIT;
+         sensor->unitid = UNIT_FAHRENHEIT;
+         sensor_save_all();
+      }
       sensor->flags.data_ok = true;
       return HTTP_RQT_SUCCESS;
     }
     else if (sensor->type == SENSOR_FYTA_MOISTURE) {
       sensor->last_data = plant["measurements"]["moisture"]["values"]["current"].as<double>();
+      if (sensor->assigned_unitid != UNIT_PERCENT) {
+        sensor->assigned_unitid = UNIT_PERCENT;
+        sensor->unitid = UNIT_PERCENT;
+        sensor_save_all();
+      }
       sensor->flags.data_ok = true;
       return HTTP_RQT_SUCCESS;
     }

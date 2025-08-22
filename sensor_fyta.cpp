@@ -3,6 +3,8 @@
 using ArduinoJson::JsonDocument;
 using ArduinoJson::DeserializationError;
 
+static bool init = false;
+
 /**
  * @brief FYTA Public API Client
  * https://fyta-io.notion.site/FYTA-Public-API-d2f4c30306f74504924c9a40402a3afd
@@ -14,9 +16,11 @@ bool FytaApi::authenticate() {
     JsonDocument payload;
     payload["email"] = userEmail;
     payload["password"] = userPassword;
-    char requestBody[128];
-    serializeJson(payload, requestBody, sizeof(requestBody));
+    std::string requestBody;
+    serializeJson(payload, requestBody);
     authToken = "";
+    DEBUG_PRINTLN("FYTA AUTH");
+    DEBUG_PRINTLN(requestBody.c_str());
 
 #if defined(ESP8266)
     HTTPClient http;
@@ -26,35 +30,56 @@ bool FytaApi::authenticate() {
     if (res == 200) {
         JsonDocument responseDoc;
         DeserializationError error = deserializeJson(responseDoc, http.getString());
-        if (!error && responseDoc.containsKey("token")) {
-            authToken = responseDoc["token"].as<String>();
+        if (!error && responseDoc.containsKey("access_token")) {
+            authToken = responseDoc["access_token"].as<String>();
             http.end();
             return true;
         }
     }
     http.end();
 #elif defined(OSPI)
-    httplib::Client http(FYTA_URL, 443);
-    auto res = http.Post(FYTA_URL_LOGIN, requestBody, "application/json");
-    if (res && res->status == 200) {
-        JsonDocument responseDoc;
-        DeserializationError error = deserializeJson(responseDoc, res->body);   
-        if (!error && responseDoc.containsKey("token")) {
-            authToken = responseDoc["token"].as<String>();
-            return true;
-        }
+    naettReq* req =
+        naettRequest(FYTA_URL_LOGIN, 
+            naettMethod("POST"), 
+            naettHeader("accept", "application/json"), 
+            naettHeader("Content-Type", "application/json"), 
+            naettBody(requestBody.c_str(), requestBody.length()));
+
+    naettRes* res = naettMake(req);
+    while (!naettComplete(res)) {
+        usleep(100 * 1000);
     }
+
+    if (naettGetStatus(res) < 0) {
+        DEBUG_PRINTLN("Request failed");
+        naettFree(req);
+        return false;
+    }
+
+    int bodyLength = 0;
+    const char* body = (char*)naettGetBody(res, &bodyLength);
+    JsonDocument responseDoc;
+    DeserializationError error = deserializeJson(responseDoc, body, bodyLength);
+    if (!error && responseDoc.containsKey("access_token")) {
+        authToken = responseDoc["access_token"].as<String>();
+    }
+    naettClose(res);
+    naettFree(req);  
 #endif
-    return false;
+    DEBUG_PRINTLN("AUTH-TOKEN:");
+    DEBUG_PRINTLN(authToken.c_str());
+    return true;
 }
 
 // Query sensor values
-bool FytaApi::getSensorData(int plantId, JsonDocument& doc) {
-
+bool FytaApi::getSensorData(ulong plantId, JsonDocument& doc) {
+    DEBUG_PRINTLN("FYTA getSensorData");
 #if defined(ESP8266)
     if (authToken.isEmpty()) return false;
     HTTPClient http;
-    String url = FYTA_URL_USER_PLANT2 + String(plantId);
+    char url[50];
+    sprintf(url, FYTA_URL_USER_PLANTF, plantId);
+    DEBUG_PRINTLN(url);
     http.begin(*client, url);
     http.addHeader("Authorization", "Bearer " + authToken);
     http.addHeader("Content-Type", "application/json");
@@ -65,27 +90,43 @@ bool FytaApi::getSensorData(int plantId, JsonDocument& doc) {
         return !error;
     }
     http.end();
+    return false;
 #elif defined(OSPI)
     if (authToken.empty()) return false;
-    httplib::Client http(FYTA_URL, 443);
-    httplib::Headers headers = {
-        {"Authorization", "Bearer " + authToken},
-        {"Content-Type", "application/json"}
-    };
-    std::string url = FYTA_URL_USER_PLANT2 + std::to_string(plantId);
-    auto res = http.Get(url, headers);
-    if (res && res->status == 200) {
-        DeserializationError error = deserializeJson(doc, res->body);
-        if (!error) {
-            return true;
-        }
+    std::string auth = "Bearer " + authToken;
+    char url[50];
+    sprintf(url, FYTA_URL_USER_PLANTF, plantId);
+    DEBUG_PRINTLN(url);
+    naettReq* req =
+        naettRequest(url, 
+            naettMethod("GET"), 
+            naettHeader("accept", "application/json"), 
+            naettHeader("Content-Type", "application/json"), 
+            naettHeader("Authorization", auth.c_str()));
+
+    naettRes* res = naettMake(req);
+    while (!naettComplete(res)) {
+        usleep(100 * 1000);
     }
+
+    int bodyLength = 0;
+    const char* body = (char*)naettGetBody(res, &bodyLength);
+    DeserializationError error = deserializeJson(doc, body, bodyLength);
+    if (naettGetStatus(res) < 0 || !body || !bodyLength || error) {
+        DEBUG_PRINTLN("FYTA Request failed");
+        naettClose(res);
+        naettFree(req);
+        return false;
+    }
+    DEBUG_PRINTLN("FYTA getSensorData OK");
+    naettClose(res);
+    naettFree(req);  
+    return true;
 #endif
-    return false;
 }
 
 bool FytaApi::getPlantList(JsonDocument& doc) {
-
+    DEBUG_PRINTLN("FYTA getPlantList");
 #if defined(ESP8266)
     if (authToken.isEmpty()) return false;      
     HTTPClient http;
@@ -102,22 +143,40 @@ bool FytaApi::getPlantList(JsonDocument& doc) {
         }
     }
     http.end();
-#elif defined(OSPI)
-    if (authToken.empty()) return false;      
-    httplib::Client http(FYTA_URL, 443);
-    httplib::Headers headers = {
-        {"Authorization", "Bearer " + authToken},
-        {"Content-Type", "application/json"}
-    };
-    auto res = http.Get(FYTA_URL_USER_PLANT, headers);
-    if (res && res->status == 200) {
-        DeserializationError error = deserializeJson(doc, res->body);
-        if (!error && doc.containsKey("plants")) {
-            return true;
-        }
-    }
-#endif
     return false;
+#elif defined(OSPI)
+    if (authToken.empty()) return false; 
+    std::string auth = "Bearer " + authToken;     
+    naettReq* req =
+        naettRequest(FYTA_URL_USER_PLANT, 
+            naettMethod("GET"), 
+            naettHeader("accept", "application/json"), 
+            naettHeader("Content-Type", "application/json"), 
+            naettHeader("Authorization", auth.c_str()));
+
+    naettRes* res = naettMake(req);
+    while (!naettComplete(res)) {
+        usleep(100 * 1000);
+    }
+
+    int bodyLength = 0;
+    const char* body = (char*)naettGetBody(res, &bodyLength);
+    DEBUG_PRINTLN(body);
+    DeserializationError error = deserializeJson(doc, body, bodyLength);
+    if (naettGetStatus(res) < 0 || !body || !bodyLength || error) {
+        DEBUG_PRINTLN("FYTA Request failed!");
+        naettClose(res);
+        naettFree(req);
+        return false;
+    }
+    
+    DEBUG_PRINTLN("FYTA getPlantList OK");
+
+    naettClose(res);
+    naettFree(req);  
+
+    return true;
+#endif
 }
 
 void FytaApi::allocClient() {
@@ -126,6 +185,11 @@ void FytaApi::allocClient() {
     _c->setInsecure();
     _c->setBufferSizes(512, 512); 
     client = _c;
+#elif defined(OSPI)
+    if (!init) {
+        init = true;
+        naettInit(NULL);
+    }
 #endif   
 }
 
