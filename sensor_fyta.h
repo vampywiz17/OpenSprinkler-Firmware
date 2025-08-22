@@ -1,6 +1,8 @@
 #ifndef _SENSOR_FYTA_H
 #define _SENSOR_FYTA_H
 
+#if defined(ESP8266) || defined(OSPI)
+
 #if defined(ESP8266)
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -44,12 +46,17 @@ public:
 private:
     void allocClient();
     void freeClient();
+#if defined(ESP8266)
     String userEmail;
     String userPassword;
     String authToken;
-#if defined(ESP8266)
     WiFiClient *client;
+#else
+    std::string userEmail;
+    std::string userPassword;
+    std::string authToken;
 #endif
 };
 
+#endif // defined(ESP8266) || defined(OSPI)
 #endif // _SENSOR_FYTA_H

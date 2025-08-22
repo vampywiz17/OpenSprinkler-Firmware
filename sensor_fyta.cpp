@@ -1,22 +1,30 @@
 #include "sensor_fyta.h"
 
+#if defined(ESP8266) || defined(OSPI)
+
 using ArduinoJson::JsonDocument;
 using ArduinoJson::DeserializationError;
 
-static bool init = false;
+#if defined(OSPI)
+static bool fyta_init = false;
+#endif
 
 /**
  * @brief FYTA Public API Client
  * https://fyta-io.notion.site/FYTA-Public-API-d2f4c30306f74504924c9a40402a3afd
  *
  * httplib: https://github.com/yhirose/cpp-httplib
- * 
+ *
  */
 bool FytaApi::authenticate() {
     JsonDocument payload;
     payload["email"] = userEmail;
     payload["password"] = userPassword;
+#if defined(ESP8266) 
+    String requestBody;
+#else
     std::string requestBody;
+#endif
     serializeJson(payload, requestBody);
     authToken = "";
     DEBUG_PRINTLN("FYTA AUTH");
@@ -26,7 +34,8 @@ bool FytaApi::authenticate() {
     HTTPClient http;
     http.begin(*client, FYTA_URL_LOGIN);
     http.addHeader("Content-Type", "application/json");
-    int res = http.POST(requestBody);
+    http.addHeader("accept", "application/json");
+    int res = http.POST(requestBody.c_str());
     if (res == 200) {
         JsonDocument responseDoc;
         DeserializationError error = deserializeJson(responseDoc, http.getString());
@@ -39,10 +48,10 @@ bool FytaApi::authenticate() {
     http.end();
 #elif defined(OSPI)
     naettReq* req =
-        naettRequest(FYTA_URL_LOGIN, 
-            naettMethod("POST"), 
-            naettHeader("accept", "application/json"), 
-            naettHeader("Content-Type", "application/json"), 
+        naettRequest(FYTA_URL_LOGIN,
+            naettMethod("POST"),
+            naettHeader("accept", "application/json"),
+            naettHeader("Content-Type", "application/json"),
             naettBody(requestBody.c_str(), requestBody.length()));
 
     naettRes* res = naettMake(req);
@@ -64,7 +73,7 @@ bool FytaApi::authenticate() {
         authToken = responseDoc["access_token"].as<String>();
     }
     naettClose(res);
-    naettFree(req);  
+    naettFree(req);
 #endif
     DEBUG_PRINTLN("AUTH-TOKEN:");
     DEBUG_PRINTLN(authToken.c_str());
@@ -83,6 +92,7 @@ bool FytaApi::getSensorData(ulong plantId, JsonDocument& doc) {
     http.begin(*client, url);
     http.addHeader("Authorization", "Bearer " + authToken);
     http.addHeader("Content-Type", "application/json");
+    http.addHeader("accept", "application/json");
     int httpCode = http.GET();
     if (httpCode == 200) {
         DeserializationError error = deserializeJson(doc, http.getString());
@@ -98,10 +108,10 @@ bool FytaApi::getSensorData(ulong plantId, JsonDocument& doc) {
     sprintf(url, FYTA_URL_USER_PLANTF, plantId);
     DEBUG_PRINTLN(url);
     naettReq* req =
-        naettRequest(url, 
-            naettMethod("GET"), 
-            naettHeader("accept", "application/json"), 
-            naettHeader("Content-Type", "application/json"), 
+        naettRequest(url,
+            naettMethod("GET"),
+            naettHeader("accept", "application/json"),
+            naettHeader("Content-Type", "application/json"),
             naettHeader("Authorization", auth.c_str()));
 
     naettRes* res = naettMake(req);
@@ -120,7 +130,7 @@ bool FytaApi::getSensorData(ulong plantId, JsonDocument& doc) {
     }
     DEBUG_PRINTLN("FYTA getSensorData OK");
     naettClose(res);
-    naettFree(req);  
+    naettFree(req);
     return true;
 #endif
 }
@@ -128,30 +138,31 @@ bool FytaApi::getSensorData(ulong plantId, JsonDocument& doc) {
 bool FytaApi::getPlantList(JsonDocument& doc) {
     DEBUG_PRINTLN("FYTA getPlantList");
 #if defined(ESP8266)
-    if (authToken.isEmpty()) return false;      
+    if (authToken.isEmpty()) return false;
     HTTPClient http;
     http.begin(*client, FYTA_URL_USER_PLANT);
     http.addHeader("Authorization", "Bearer " + authToken);
     http.addHeader("Content-Type", "application/json");
+    http.addHeader("accept", "application/json");
 
     int httpCode = http.GET();
     if (httpCode == 200) {
-        DeserializationError error = deserializeJson(doc, http.getString());   
+        DeserializationError error = deserializeJson(doc, http.getString());
         if (!error && doc.containsKey("plants")) {
             http.end();
-            return true;    
+            return true;
         }
     }
     http.end();
     return false;
 #elif defined(OSPI)
-    if (authToken.empty()) return false; 
-    std::string auth = "Bearer " + authToken;     
+    if (authToken.empty()) return false;
+    std::string auth = "Bearer " + authToken;
     naettReq* req =
-        naettRequest(FYTA_URL_USER_PLANT, 
-            naettMethod("GET"), 
-            naettHeader("accept", "application/json"), 
-            naettHeader("Content-Type", "application/json"), 
+        naettRequest(FYTA_URL_USER_PLANT,
+            naettMethod("GET"),
+            naettHeader("accept", "application/json"),
+            naettHeader("Content-Type", "application/json"),
             naettHeader("Authorization", auth.c_str()));
 
     naettRes* res = naettMake(req);
@@ -169,11 +180,11 @@ bool FytaApi::getPlantList(JsonDocument& doc) {
         naettFree(req);
         return false;
     }
-    
+
     DEBUG_PRINTLN("FYTA getPlantList OK");
 
     naettClose(res);
-    naettFree(req);  
+    naettFree(req);
 
     return true;
 #endif
@@ -183,14 +194,14 @@ void FytaApi::allocClient() {
 #if defined(ESP8266)
     WiFiClientSecure *_c = new WiFiClientSecure();
     _c->setInsecure();
-    _c->setBufferSizes(512, 512); 
+    _c->setBufferSizes(512, 512);
     client = _c;
 #elif defined(OSPI)
-    if (!init) {
-        init = true;
+    if (!fyta_init) {
+        fyta_init = true;
         naettInit(NULL);
     }
-#endif   
+#endif
 }
 
 void FytaApi::freeClient() {
@@ -198,6 +209,8 @@ void FytaApi::freeClient() {
     if (client) {
         delete client;
         client = nullptr;
-    }   
+    }
 #endif
 }
+
+#endif // defined(ESP8266) || defined(OSPI)

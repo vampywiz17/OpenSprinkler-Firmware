@@ -559,10 +559,10 @@ void server_change_board_attrib(char *p, char header, unsigned char *attrib)
 	unsigned char bid;
 	tbuf2[0]=header;
 	for(bid=0;bid<os.nboards;bid++) {
-		snprintf(tbuf2+1, 3, "%d", bid);
-		if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, tbuf2)) {
-			attrib[bid] = atoi(tmp_buffer);
-		}
+          snprintf(tbuf2 + 1, 3, "%hhu", (int)bid);
+          if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, tbuf2)) {
+            attrib[bid] = atoi(tmp_buffer);
+          }
 	}
 }
 
@@ -578,7 +578,7 @@ void server_change_stations_attrib(char *p, char header, unsigned char *attrib)
 	for(bid=0;bid<os.nboards;bid++) {
 		for(s=0;s<8;s++) {
 			sid=bid*8+s;
-			snprintf(tbuf2+1, 3, "%d", sid);
+			snprintf(tbuf2+1, 3, "%hhu", (int)sid);
 			if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, tbuf2)) {
 				attrib[sid] = atoi(tmp_buffer);
 			}
@@ -598,7 +598,7 @@ void server_change_stations_attrib16(char *p, char header, uint16_t *attrib)
 	for(bid=0;bid<os.nboards;bid++) {
 		for(s=0;s<8;s++) {
 			sid=bid*8+s;
-			snprintf(tbuf2+1, 3, "%d", sid);
+			snprintf(tbuf2+1, 3, "%hhu", (int)sid);
 			if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, tbuf2)) {
 				attrib[sid] = atoi(tmp_buffer);
 			}
@@ -631,7 +631,7 @@ void server_change_stations(OTF_PARAMS_DEF) {
 	char tbuf2[5] = {'s', 0, 0, 0, 0};
 	// process station names
 	for(sid=0;sid<os.nstations;sid++) {
-		snprintf(tbuf2+1, 3, "%d", sid);
+		snprintf(tbuf2+1, 3, "%hhu", (int)sid);
 		if(findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, tbuf2)) {
 			#if !defined(USE_OTF)
 			urlDecode(tmp_buffer);
@@ -2984,6 +2984,7 @@ void server_sensorlog_clear(OTF_PARAMS_DEF) {
 	handle_return(HTML_OK);
 }
 
+#if defined(ESP8266) || defined(OSPI)
 void server_fyta_get_credentials(OTF_PARAMS_DEF) {
 #if defined(USE_OTF)
 	if(!process_password(OTF_PARAMS)) return;
@@ -3061,9 +3062,15 @@ void server_fyta_query_plants(OTF_PARAMS_DEF) {
 		if (plant.containsKey("sensor") && plant["sensor"]["has_sensor"].as<bool>()) {
 			if (first) first = false; else bfill.emit_p(PSTR(","));
 			ulong id = plant["id"];
+		#if defined(ESP8266)
+			String nickname = plant["nickname"];
+			String scientific_name = plant["scientific_name"];
+			String thumb = plant["plant_origin_path"];
+		#elif defined(OSPI)
 			string nickname = plant["nickname"];
 			string scientific_name = plant["scientific_name"];
 			string thumb = plant["plant_origin_path"];
+		#endif
 			bfill.emit_p(PSTR("{\"id\":$L,\"nickname\":\"$S\",\"scientific_name\":\"$S\",\"thumb\":\"$S\"}"),
 				id, nickname.c_str(), scientific_name.c_str(), thumb.c_str());
 
@@ -3077,6 +3084,7 @@ void server_fyta_query_plants(OTF_PARAMS_DEF) {
 	handle_return(HTML_OK);
 	DEBUG_PRINTLN(F("server_fyta_query_plants done"));	
 }
+#endif
 
 /**
  * mt
@@ -3595,9 +3603,11 @@ static const int sensor_types[] = {
 #if defined(OSPI)
     SENSOR_OSPI_INTERNAL_TEMP,
 #endif
+
+#if defined(ESP8266) || defined(OSPI)
     SENSOR_FYTA_MOISTURE,
     SENSOR_FYTA_TEMPERATURE,
-	
+#endif
 	SENSOR_MQTT,
 	SENSOR_REMOTE,
 	SENSOR_WEATHER_TEMP_F,
@@ -3648,8 +3658,10 @@ static const char* sensor_names[] = {
 #if defined(OSPI)
     "Internal Raspbery Pi temperature",
 #endif
+#if defined(ESP8266) || defined(OSPI)
 	"FYTA moisture sensor",
 	"FYTA temperature sensor",
+#endif
 
 	"MQTT subscription",
 	"Remote opensprinkler sensor",
@@ -4171,8 +4183,10 @@ const char _url_keys[] PROGMEM =
 	"mc"
 	"ml"
 	"mt"
+#if defined(ESP8266) || defined(OSPI)
 	"fy"
 	"fc"
+#endif
 #if defined(ARDUINO)
 	//"ff"
 #endif
@@ -4225,8 +4239,10 @@ URLHandler urls[] = {
 	server_monitor_config, // mc
 	server_monitor_list, // ml
 	server_monitor_types, // mt
+#if defined(ESP8266) || defined(OSPI)
 	server_fyta_query_plants, // fy
 	server_fyta_get_credentials, //fc
+#endif
 	//server_fill_files,
 };
 
