@@ -3,6 +3,8 @@
 #if defined(ESP8266) || defined(OSPI)
 
 using ArduinoJson::JsonDocument;
+using ArduinoJson::JsonVariant;
+using ArduinoJson::JsonString;
 using ArduinoJson::DeserializationError;
 
 #if defined(OSPI)
@@ -172,7 +174,6 @@ bool FytaApi::getPlantList(JsonDocument& doc) {
 
     int bodyLength = 0;
     const char* body = (char*)naettGetBody(res, &bodyLength);
-    DEBUG_PRINTLN(body);
     DeserializationError error = deserializeJson(doc, body, bodyLength);
     if (naettGetStatus(res) < 0 || !body || !bodyLength || error) {
         DEBUG_PRINTLN("FYTA Request failed!");
@@ -190,31 +191,30 @@ bool FytaApi::getPlantList(JsonDocument& doc) {
 #endif
 }
 
-bool FytaApi::getPlantThumb(ulong plantId, JsonDocument& doc) {
+uint8_t * FytaApi::getPlantThumb(const char *thumbPath, uint& resSize) {
     DEBUG_PRINTLN("FYTA getPlantThumb");
+    resSize = 0;
 #if defined(ESP8266)
-    if (authToken.isEmpty()) return false;
+    if (authToken.isEmpty()) return NULL;
     HTTPClient http;
-    DEBUG_PRINTLN(doc["thumb_path"]);
-    http.begin(*client, doc["thumb_path"]);
+    http.begin(*client, thumbPath);
     http.addHeader("Authorization", "Bearer " + authToken);
-    http.addHeader("Content-Type", "application/json");
     int httpCode = http.GET();
     if (httpCode == 200) {
-        doc["thumb"] = http.getString();
+        resSize = http.getSize();
+        uint8_t *res = (uint8_t*)malloc(resSize);
+        memcpy(res, http.getString(), resSize);
         http.end();
-        return true;
+        return res;
     }
     http.end();
-    return false;
+    return NULL;
 #elif defined(OSPI)
-    if (authToken.empty()) return false;
+    if (authToken.empty()) return NULL;
     std::string auth = "Bearer " + authToken;
-    DEBUG_PRINTLN(doc["thumb_path"]);
     naettReq* req =
-        naettRequest(doc["thumb_path"],
+        naettRequest(thumbPath,
             naettMethod("GET"),
-            naettHeader("Content-Type", "application/json"),
             naettHeader("Authorization", auth.c_str()));
 
     naettRes* res = naettMake(req);
@@ -224,17 +224,19 @@ bool FytaApi::getPlantThumb(ulong plantId, JsonDocument& doc) {
 
     int bodyLength = 0;
     const char* body = (char*)naettGetBody(res, &bodyLength);
-    doc["thumb"] = std::string(body, bodyLength);
-    if (naettGetStatus(res) < 0 || !body || !bodyLength || error) {
+    if (naettGetStatus(res) < 0 || !body || !bodyLength) {
         DEBUG_PRINTLN("FYTA Request failed");
         naettClose(res);
         naettFree(req);
-        return false;
+        return NULL;
     }
     DEBUG_PRINTLN("FYTA getSensorData OK");
+    uint8_t *r = (uint8_t*)malloc(bodyLength);
+    memcpy(r, body, bodyLength);
+    resSize = bodyLength;
     naettClose(res);
     naettFree(req);
-    return true;
+    return r;
 #endif
 }
 

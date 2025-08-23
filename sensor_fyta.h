@@ -14,6 +14,7 @@
 #include "OpenSprinkler.h"
 
 using ArduinoJson::JsonDocument;
+using ArduinoJson::JsonVariant;
 using ArduinoJson::DeserializationError;
 
 #define FYTA_URL "https://web.fyta.de"
@@ -44,19 +45,24 @@ public:
     // Get plant list
     bool getPlantList(JsonDocument& doc);
     // Get plant thumb
-    bool getPlantThumb(ulong plantId, JsonDocument& doc);
+    uint8_t * getPlantThumb(const char *thumbPath, uint& resSize);
+
+#if defined(ESP8266)
+    String authToken;
+#else
+    std::string authToken;
+#endif
+    
 private:
     void allocClient();
     void freeClient();
 #if defined(ESP8266)
     String userEmail;
     String userPassword;
-    String authToken;
     WiFiClient *client;
 #else
     std::string userEmail;
     std::string userPassword;
-    std::string authToken;
 #endif
 };
 

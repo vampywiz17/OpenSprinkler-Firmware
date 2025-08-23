@@ -53,7 +53,7 @@ public:
 	char* buffer () const { return start; }
 	size_t length () const { return len; }
 	unsigned int position () const { return ptr - start; }
-
+	void append(const char* buf, size_t len) { memcpy(ptr, buf, len); ptr += len; *(ptr)=0; }
 	void emit_p(PGM_P fmt, ...) {
 		va_list ap;
 		va_start(ap, fmt);

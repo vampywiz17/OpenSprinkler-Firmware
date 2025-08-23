@@ -1708,12 +1708,6 @@ int read_sensor_fyta(Sensor_t *sensor, ulong time) {
       return HTTP_RQT_NOT_RECEIVED;
     }
 
-#if defined(ENABLE_DEBUG)
-    std::string debugOut;
-    serializeJson(doc, debugOut);
-    DEBUG_PRINTLN(debugOut.c_str());
-#endif
-
     if (!doc.containsKey("plant")) {
       sensor->flags.data_ok = false;
       return HTTP_RQT_NOT_RECEIVED;
@@ -2514,6 +2508,12 @@ unsigned char getSensorUnitId(int type) {
     case SENSOR_OSPI_INTERNAL_TEMP:
       return UNIT_DEGREE;
 #endif
+
+    case SENSOR_FYTA_MOISTURE: 
+      return UNIT_PERCENT;  
+    case SENSOR_FYTA_TEMPERATURE:
+      return UNIT_DEGREE;
+    
     case SENSOR_MQTT:
       return UNIT_USERDEF;
     case SENSOR_WEATHER_TEMP_F:
@@ -2586,6 +2586,12 @@ unsigned char getSensorUnitId(Sensor_t *sensor) {
     case SENSOR_OSPI_INTERNAL_TEMP:
       return UNIT_DEGREE;
 #endif
+
+    case SENSOR_FYTA_MOISTURE: 
+      return sensor->assigned_unitid;  
+    case SENSOR_FYTA_TEMPERATURE:
+      return sensor->assigned_unitid;
+
     case SENSOR_USERDEF:
     case SENSOR_MQTT:
     case SENSOR_REMOTE:

@@ -3019,6 +3019,11 @@ void server_fyta_get_credentials(OTF_PARAMS_DEF) {
         DEBUG_PRINTLN(F("server_fyta_get_credentials done"));
 }
 
+void write_base64(const char* output, uint outputLen, void *p1, void *p2) {
+	bfill.append(output, outputLen);
+	if (available_ether_buffer() <= 0) send_packet((const OTF::Request&)p1, (OTF::Response&)p2);
+}
+
 void server_fyta_query_plants(OTF_PARAMS_DEF) {
 #if defined(USE_OTF)
 	if(!process_password(OTF_PARAMS)) return;
@@ -3056,39 +3061,24 @@ void server_fyta_query_plants(OTF_PARAMS_DEF) {
     DEBUG_PRINT("found plants: ");
     DEBUG_PRINTLN(doc["plants"].size());
 
-	bfill.emit_p(PSTR("{\"plants\":["));
+	bfill.emit_p(PSTR("{\"token\":\"$S\",\"plants\":["), fytaapi.authToken.c_str());
 	bool first = true;
 	for (JsonVariant plant : doc["plants"].as<JsonArray>()) {
 		if (plant.containsKey("sensor") && plant["sensor"]["has_sensor"].as<bool>()) {
 			if (first) first = false; else bfill.emit_p(PSTR(","));
 			ulong id = plant["id"];
+			
 		#if defined(ESP8266)
 			String nickname = plant["nickname"];
 			String scientific_name = plant["scientific_name"];
-			String thumb = plant["thumb"];
+			String thumb = plant["thumb_path"];
 		#elif defined(OSPI)
 			string nickname = plant["nickname"];
 			string scientific_name = plant["scientific_name"];
-			string thumb = plant["thumb"];
+			string thumb = plant["thumb_path"];
 		#endif
-			bfill.emit_p(PSTR("{\"id\":$L,\"nickname\":\"$S\",\"scientific_name\":\"$S\",\"thumb\":\""),
-				id, nickname.c_str(), scientific_name.c_str());
-			send_packet(OTF_PARAMS);
-			
-			int len = thumb.length();
-			int pos = 0;
-			const char *c = (char*)thumb.c_str();
-			while (pos < len) {
-
-				int size = len-pos;
-				if (size > ETHER_BUFFER_SIZE)
-					size = ETHER_BUFFER_SIZE;
-				strncpy(ether_buffer, c+pos, size);
-				ether_buffer[size] = 0; // null-terminate
-				send_packet(OTF_PARAMS);
-				pos += size;
-			}
-			bfill.emit_p(PSTR("\"}"));
+			bfill.emit_p(PSTR("{\"id\":$L,\"nickname\":\"$S\",\"scientific_name\":\"$S\",\"thumb\":\"$S\"}"),
+				id, nickname.c_str(), scientific_name.c_str(), thumb.c_str());
 		}
 	}
 	bfill.emit_p(PSTR("]}"));
