@@ -3414,7 +3414,7 @@ int findValue(const char *payload, unsigned int length, const char *jsonFilter, 
 	bool emptyFilter = !jsonFilter||!jsonFilter[0];
 
 	while (!emptyFilter && f && p) {
-		f = strstr(jsonFilter, "|");
+		f = strstr((char*)jsonFilter, "|");
 		if (f) {
 			p = strnlstr(p, jsonFilter, f-jsonFilter, (char*)payload-p+length);
 			jsonFilter = f+1;
@@ -3449,7 +3449,7 @@ int findString(const char *payload, unsigned int length, const char *jsonFilter,
 	bool emptyFilter = !jsonFilter||!jsonFilter[0];
 
 	while (!emptyFilter && f && p) {
-		f = strstr(jsonFilter, "|");
+		f = strstr((char*)jsonFilter, "|");
 		if (f) {
 			p = strnlstr(p, jsonFilter, f-jsonFilter, (char*)payload-p+length);
 			jsonFilter = f+1;
@@ -3466,7 +3466,11 @@ int findString(const char *payload, unsigned int length, const char *jsonFilter,
       p++;
       char *q = strchr(p, '\"');
       if (q) {
-        value.concat(p, q-p);
+#if defined(ESP8266)
+        value.copy(p, q-p);
+#else
+        value.assign(p, q-p);
+#endif
         return 1;
       }
     }

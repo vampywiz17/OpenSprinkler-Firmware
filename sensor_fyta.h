@@ -36,7 +36,9 @@ public:
             authenticate(auth);
         }
     ~FytaApi() {
+#if defined(ESP8266)
         http.end();
+#endif
     }
 
     // Authenticate and store token
