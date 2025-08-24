@@ -3467,7 +3467,7 @@ int findString(const char *payload, unsigned int length, const char *jsonFilter,
       char *q = strchr(p, '\"');
       if (q) {
 #if defined(ESP8266)
-        value.copy(p, q-p);
+        value.concat(p, q-p);
 #else
         value.assign(p, q-p);
 #endif
