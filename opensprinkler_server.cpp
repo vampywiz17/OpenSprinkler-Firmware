@@ -3042,19 +3042,13 @@ void server_fyta_query_plants(OTF_PARAMS_DEF) {
 	print_header();
 #endif
 
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, os.sopt_load(SOPT_FYTA_OPTS));
-    if (error || !doc.containsKey("email") || !doc.containsKey("password")) {
-      DEBUG_PRINTLN(F("No fyta credentials found!"));
-	  handle_return(HTML_NOT_PERMITTED);
-	  return;
-    }
-
-    FytaApi fytaapi(doc["email"], doc["password"]);
+    FytaApi fytaapi(os.sopt_load(SOPT_FYTA_OPTS));
     
+    JsonDocument doc;
     if (!fytaapi.getPlantList(doc)) {
       DEBUG_PRINTLN(F("No fyta plants found!"));
-	  handle_return(HTML_NOT_PERMITTED);
+	  bfill.emit_p(PSTR("{\"token\":\"$S\",\"error\":\"$S\",\"plants\":[]}"), fytaapi.authToken.c_str(), doc["error"].as<const char*>());
+	  handle_return(HTML_OK);
 	  return;
     }
 

@@ -5,7 +5,7 @@
 
 #if defined(ESP8266)
 #include <ESP8266HTTPClient.h>
-#include <WiFiClientSecure.h>
+//#include <WiFiClientSecure.h>
 #elif defined(OSPI)
 #include "naett.h"
 #endif
@@ -13,15 +13,17 @@
 #include "ArduinoJson.hpp"
 #include "OpenSprinkler.h"
 
-using ArduinoJson::JsonDocument;
-using ArduinoJson::JsonVariant;
-using ArduinoJson::DeserializationError;
+using namespace ArduinoJson;
 
-#define FYTA_URL "https://web.fyta.de"
+#if defined(ESP8266)
+#define FYTA_URL_LOGIN "http://web.fyta.de/api/auth/login"
+#define FYTA_URL_USER_PLANT "http://web.fyta.de/api/user-plant"
+#define FYTA_URL_USER_PLANTF "http://web.fyta.de/api/user-plant/%lu"
+#else
 #define FYTA_URL_LOGIN "https://web.fyta.de/api/auth/login"
 #define FYTA_URL_USER_PLANT "https://web.fyta.de/api/user-plant"
 #define FYTA_URL_USER_PLANTF "https://web.fyta.de/api/user-plant/%lu"
-
+#endif
 /**
  * @brief FYTA Public API Client
  * https://fyta-io.notion.site/FYTA-Public-API-d2f4c30306f74504924c9a40402a3afd
@@ -29,24 +31,20 @@ using ArduinoJson::DeserializationError;
  */
 class FytaApi {
 public:
-    FytaApi(const String& email, const String& password)
-        : userEmail(email), userPassword(password) { 
-            allocClient();
-            authenticate();
+    FytaApi(const String& auth) {
+            init();
+            authenticate(auth);
         }
     ~FytaApi() {
-        freeClient();
+        http.end();
     }
 
     // Authenticate and store token
-    bool authenticate();
+    bool authenticate(const String &auth);
     // Query sensor values
     bool getSensorData(ulong plantId, JsonDocument& doc);
     // Get plant list
     bool getPlantList(JsonDocument& doc);
-    // Get plant thumb
-    uint8_t * getPlantThumb(const char *thumbPath, uint& resSize);
-
 #if defined(ESP8266)
     String authToken;
 #else
@@ -54,12 +52,10 @@ public:
 #endif
     
 private:
-    void allocClient();
-    void freeClient();
+    void init();
 #if defined(ESP8266)
-    String userEmail;
-    String userPassword;
-    WiFiClient *client;
+    WiFiClient client;
+    HTTPClient http;
 #else
     std::string userEmail;
     std::string userPassword;

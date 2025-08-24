@@ -465,5 +465,7 @@ bool checkDiskFree();  // true: disk space Ok, false: Out of disk space
 #endif
 
 void replace_pid(uint old_pid, uint new_pid);
+int findValue(const char *payload, unsigned int length, const char *jsonFilter, double& value);
+int findString(const char *payload, unsigned int length, const char *jsonFilter, String& value);
 
 #endif  // _SENSORS_H

@@ -2,10 +2,7 @@
 
 #if defined(ESP8266) || defined(OSPI)
 
-using ArduinoJson::JsonDocument;
-using ArduinoJson::JsonVariant;
-using ArduinoJson::JsonString;
-using ArduinoJson::DeserializationError;
+using namespace ArduinoJson;
 
 #if defined(OSPI)
 static bool fyta_init = false;
@@ -15,46 +12,34 @@ static bool fyta_init = false;
  * @brief FYTA Public API Client
  * https://fyta-io.notion.site/FYTA-Public-API-d2f4c30306f74504924c9a40402a3afd
  *
- * httplib: https://github.com/yhirose/cpp-httplib
+ * https://arduinojson.org/v6/how-to/use-arduinojson-with-httpclient/
  *
  */
-bool FytaApi::authenticate() {
-    JsonDocument payload;
-    payload["email"] = userEmail;
-    payload["password"] = userPassword;
-#if defined(ESP8266) 
-    String requestBody;
-#else
-    std::string requestBody;
-#endif
-    serializeJson(payload, requestBody);
+bool FytaApi::authenticate(const String &auth) {
     authToken = "";
     DEBUG_PRINTLN("FYTA AUTH");
-    DEBUG_PRINTLN(requestBody.c_str());
 
 #if defined(ESP8266)
-    HTTPClient http;
-    http.begin(*client, FYTA_URL_LOGIN);
+    http.begin(client, FYTA_URL_LOGIN);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("accept", "application/json");
-    int res = http.POST(requestBody.c_str());
+    int res = http.POST(auth.c_str());
     if (res == 200) {
         JsonDocument responseDoc;
-        DeserializationError error = deserializeJson(responseDoc, http.getString());
+        DeserializationError error = deserializeJson(responseDoc, http.getStream());
         if (!error && responseDoc.containsKey("access_token")) {
             authToken = responseDoc["access_token"].as<String>();
-            http.end();
             return true;
         }
     }
-    http.end();
+    return false;
 #elif defined(OSPI)
     naettReq* req =
         naettRequest(FYTA_URL_LOGIN,
             naettMethod("POST"),
             naettHeader("accept", "application/json"),
             naettHeader("Content-Type", "application/json"),
-            naettBody(requestBody.c_str(), requestBody.length()));
+            naettBody(auth.c_str(), auth.length()));
 
     naettRes* res = naettMake(req);
     while (!naettComplete(res)) {
@@ -87,21 +72,25 @@ bool FytaApi::getSensorData(ulong plantId, JsonDocument& doc) {
     DEBUG_PRINTLN("FYTA getSensorData");
 #if defined(ESP8266)
     if (authToken.isEmpty()) return false;
-    HTTPClient http;
     char url[50];
     sprintf(url, FYTA_URL_USER_PLANTF, plantId);
     DEBUG_PRINTLN(url);
-    http.begin(*client, url);
+    http.begin(client, url);
     http.addHeader("Authorization", "Bearer " + authToken);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("accept", "application/json");
     int httpCode = http.GET();
     if (httpCode == 200) {
-        DeserializationError error = deserializeJson(doc, http.getString());
-        http.end();
+        JsonDocument filter;
+        filter["plant"]["temperature_unit"] = true;
+        filter["plant"]["measurements"]["temperature"]["values"]["current"] = true;
+        filter["plant"]["measurements"]["moisture"]["values"]["current"] = true;
+
+        DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+        doc["error"] = error.c_str();
         return !error;
     }
-    http.end();
+    doc["error"] = httpCode;
     return false;
 #elif defined(OSPI)
     if (authToken.empty()) return false;
@@ -123,7 +112,13 @@ bool FytaApi::getSensorData(ulong plantId, JsonDocument& doc) {
 
     int bodyLength = 0;
     const char* body = (char*)naettGetBody(res, &bodyLength);
-    DeserializationError error = deserializeJson(doc, body, bodyLength);
+
+    JsonDocument filter;
+    filter["plant"]["temperature_unit"] = true;
+    filter["plant"]["measurements"]["temperature"]["values"]["current"] = true;
+    filter["plant"]["measurements"]["moisture"]["values"]["current"] = true;
+
+    DeserializationError error = deserializeJson(doc, body, bodyLength, DeserializationOption::Filter(filter));
     if (naettGetStatus(res) < 0 || !body || !bodyLength || error) {
         DEBUG_PRINTLN("FYTA Request failed");
         naettClose(res);
@@ -141,21 +136,25 @@ bool FytaApi::getPlantList(JsonDocument& doc) {
     DEBUG_PRINTLN("FYTA getPlantList");
 #if defined(ESP8266)
     if (authToken.isEmpty()) return false;
-    HTTPClient http;
-    http.begin(*client, FYTA_URL_USER_PLANT);
+    http.begin(client, FYTA_URL_USER_PLANT);
     http.addHeader("Authorization", "Bearer " + authToken);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("accept", "application/json");
 
     int httpCode = http.GET();
     if (httpCode == 200) {
-        DeserializationError error = deserializeJson(doc, http.getString());
-        if (!error && doc.containsKey("plants")) {
-            http.end();
-            return true;
-        }
+        JsonDocument filter;
+        filter["plants"][0]["id"] = true;
+        filter["plants"][0]["nickname"] = true;
+        filter["plants"][0]["scientific_name"] = true;
+        filter["plants"][0]["thumb_path"] = true;
+        filter["plants"][0]["sensor"]["has_sensor"] = true;
+
+        DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+        doc["error"] = error.c_str();
+        return !error;
     }
-    http.end();
+    doc["error"] = httpCode;
     return false;
 #elif defined(OSPI)
     if (authToken.empty()) return false;
@@ -174,7 +173,15 @@ bool FytaApi::getPlantList(JsonDocument& doc) {
 
     int bodyLength = 0;
     const char* body = (char*)naettGetBody(res, &bodyLength);
-    DeserializationError error = deserializeJson(doc, body, bodyLength);
+
+    JsonDocument filter;
+    filter["plants"][0]["id"] = true;
+    filter["plants"][0]["nickname"] = true;
+    filter["plants"][0]["scientific_name"] = true;
+    filter["plants"][0]["thumb_path"] = true;
+    filter["plants"][0]["sensor"]["has_sensor"] = true;
+
+    DeserializationError error = deserializeJson(doc, body, bodyLength, DeserializationOption::Filter(filter));
     if (naettGetStatus(res) < 0 || !body || !bodyLength || error) {
         DEBUG_PRINTLN("FYTA Request failed!");
         naettClose(res);
@@ -191,74 +198,15 @@ bool FytaApi::getPlantList(JsonDocument& doc) {
 #endif
 }
 
-uint8_t * FytaApi::getPlantThumb(const char *thumbPath, uint& resSize) {
-    DEBUG_PRINTLN("FYTA getPlantThumb");
-    resSize = 0;
+void FytaApi::init() {
 #if defined(ESP8266)
-    if (authToken.isEmpty()) return NULL;
-    HTTPClient http;
-    http.begin(*client, thumbPath);
-    http.addHeader("Authorization", "Bearer " + authToken);
-    int httpCode = http.GET();
-    if (httpCode == 200) {
-        resSize = http.getSize();
-        uint8_t *res = (uint8_t*)malloc(resSize);
-        memcpy(res, http.getString(), resSize);
-        http.end();
-        return res;
-    }
-    http.end();
-    return NULL;
-#elif defined(OSPI)
-    if (authToken.empty()) return NULL;
-    std::string auth = "Bearer " + authToken;
-    naettReq* req =
-        naettRequest(thumbPath,
-            naettMethod("GET"),
-            naettHeader("Authorization", auth.c_str()));
+    //client.setInsecure();
+    //client.setBufferSizes(512, 512);
 
-    naettRes* res = naettMake(req);
-    while (!naettComplete(res)) {
-        usleep(100 * 1000);
-    }
-
-    int bodyLength = 0;
-    const char* body = (char*)naettGetBody(res, &bodyLength);
-    if (naettGetStatus(res) < 0 || !body || !bodyLength) {
-        DEBUG_PRINTLN("FYTA Request failed");
-        naettClose(res);
-        naettFree(req);
-        return NULL;
-    }
-    DEBUG_PRINTLN("FYTA getSensorData OK");
-    uint8_t *r = (uint8_t*)malloc(bodyLength);
-    memcpy(r, body, bodyLength);
-    resSize = bodyLength;
-    naettClose(res);
-    naettFree(req);
-    return r;
-#endif
-}
-
-void FytaApi::allocClient() {
-#if defined(ESP8266)
-    WiFiClientSecure *_c = new WiFiClientSecure();
-    _c->setInsecure();
-    _c->setBufferSizes(512, 512);
-    client = _c;
 #elif defined(OSPI)
     if (!fyta_init) {
         fyta_init = true;
         naettInit(NULL);
-    }
-#endif
-}
-
-void FytaApi::freeClient() {
-#if defined(ESP8266)
-    if (client) {
-        delete client;
-        client = nullptr;
     }
 #endif
 }

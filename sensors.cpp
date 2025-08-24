@@ -1691,16 +1691,9 @@ int read_sensor_fyta(Sensor_t *sensor, ulong time) {
   if (time >= sensor->last_read + sensor->read_interval) {
     sensor->last_read = time;
 
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, os.sopt_load(SOPT_FYTA_OPTS));
-    if (error) {
-      DEBUG_PRINTLN(F("No fyta credentials found!"));
-      sensor->flags.data_ok = false;
-      return HTTP_RQT_NOT_RECEIVED;
-    }
-
-    FytaApi fytaapi(doc["email"], doc["password"]);
+    FytaApi fytaapi(os.sopt_load(SOPT_FYTA_OPTS));
     
+    JsonDocument doc;
     if (!fytaapi.getSensorData(sensor->id, doc)) {
       DEBUG_PRINTLN(F("Fyta Sensor not found!"));
       DEBUG_PRINTLN(sensor->id);
@@ -1712,13 +1705,10 @@ int read_sensor_fyta(Sensor_t *sensor, ulong time) {
       sensor->flags.data_ok = false;
       return HTTP_RQT_NOT_RECEIVED;
     }
-
-    auto plant = doc["plant"];
-
-    int unit = plant["temperature_unit"]; //1=Celsius, 2=Fahrenheit
+    int unit = doc["plant"]["temperature_unit"]; //1=Celsius, 2=Fahrenheit
     
     if (sensor->type == SENSOR_FYTA_TEMPERATURE) {
-      sensor->last_data = plant["measurements"]["temperature"]["values"]["current"].as<double>();
+      sensor->last_data = doc["plant"]["measurements"]["temperature"]["values"]["current"].as<double>();
       if (unit == 1 && sensor->assigned_unitid != UNIT_DEGREE) {
         sensor->assigned_unitid = UNIT_DEGREE;
         sensor->unitid = UNIT_DEGREE;
@@ -1733,7 +1723,7 @@ int read_sensor_fyta(Sensor_t *sensor, ulong time) {
       return HTTP_RQT_SUCCESS;
     }
     else if (sensor->type == SENSOR_FYTA_MOISTURE) {
-      sensor->last_data = plant["measurements"]["moisture"]["values"]["current"].as<double>();
+      sensor->last_data = doc["plant"]["measurements"]["moisture"]["values"]["current"].as<double>();
       if (sensor->assigned_unitid != UNIT_PERCENT) {
         sensor->assigned_unitid = UNIT_PERCENT;
         sensor->unitid = UNIT_PERCENT;
@@ -3401,4 +3391,85 @@ void replace_pid(uint old_pid, uint new_pid) {
     psa = psa->next;
   }
   sensor_save_all();
-} 
+}
+
+char *strnlstr(const char *haystack, const char *needle, size_t needle_len, size_t len)
+{
+  int i;
+  for (i=0; i<=(int)(len-needle_len); i++)
+  {
+		if (haystack[0] == 0)
+			break;
+    if ((haystack[0] == needle[0]) &&
+        (strncmp(haystack, needle, needle_len) == 0))
+            return (char *)haystack;
+    haystack++;
+  }
+  return NULL;
+}
+
+int findValue(const char *payload, unsigned int length, const char *jsonFilter, double& value) {
+	char *p = (char*)payload;				
+	char *f = (char*)jsonFilter;
+	bool emptyFilter = !jsonFilter||!jsonFilter[0];
+
+	while (!emptyFilter && f && p) {
+		f = strstr(jsonFilter, "|");
+		if (f) {
+			p = strnlstr(p, jsonFilter, f-jsonFilter, (char*)payload-p+length);
+			jsonFilter = f+1;
+		} else {
+			p = strstr(p, jsonFilter);
+		}
+	}
+	if (p) {
+		p += emptyFilter?0:strlen(jsonFilter);
+		char buf[30];
+		p = strpbrk(p, "0123456789.-+nullNULL");
+		uint i = 0;
+		while (p && i < sizeof(buf) && p < (char*)payload+length) {
+			char ch = *p++;
+			if ((ch >= '0' && ch <= '9') || ch == '.' || ch == '-' || ch == '+') {
+				buf[i++] = ch;
+			} else break;
+		}
+		buf[i] = 0;
+		DEBUG_PRINT("result: ");
+		DEBUG_PRINTLN(buf);	
+
+		value = -9999;
+		return sscanf(buf, "%lf", &value);
+	}
+	return 0;
+}
+
+int findString(const char *payload, unsigned int length, const char *jsonFilter, String& value) {
+	char *p = (char *)payload;				
+	char *f = (char *)jsonFilter;
+	bool emptyFilter = !jsonFilter||!jsonFilter[0];
+
+	while (!emptyFilter && f && p) {
+		f = strstr(jsonFilter, "|");
+		if (f) {
+			p = strnlstr(p, jsonFilter, f-jsonFilter, (char*)payload-p+length);
+			jsonFilter = f+1;
+		} else {
+			p = strstr(p, jsonFilter);
+		}
+	}
+  value = "";
+	if (p) {
+		p += emptyFilter?0:strlen(jsonFilter)+1;
+
+    p = strchr(p, '\"');
+    if (p) {
+      p++;
+      char *q = strchr(p, '\"');
+      if (q) {
+        value.concat(p, q-p);
+        return 1;
+      }
+    }
+	}
+	return 0;
+}
