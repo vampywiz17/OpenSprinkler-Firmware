@@ -184,7 +184,7 @@ void fyta_check_opts() {
 
     file_read_block(SOPTS_FILENAME, tmp_buffer, SOPT_FYTA_OPTS*MAX_SOPTS_SIZE, MAX_SOPTS_SIZE);
     if (tmp_buffer[0] != '{') {
-      strcpy(tmp_buffer, "{\"email\":\"\",\"password\":\"\"}");
+      strcpy(tmp_buffer, "{\"token\":\"\"}");
       file_write_block(SOPTS_FILENAME, tmp_buffer, SOPT_FYTA_OPTS*MAX_SOPTS_SIZE, MAX_SOPTS_SIZE);
     }
 }

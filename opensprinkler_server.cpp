@@ -3005,8 +3005,8 @@ void server_fyta_get_credentials(OTF_PARAMS_DEF) {
 
 	JsonDocument doc;
 	DeserializationError error = deserializeJson(doc, os.sopt_load(SOPT_FYTA_OPTS));
-	if (error || !doc.containsKey("email") || !doc.containsKey("password")) {
-		strcpy(tmp_buffer, "{\"email\":\"\",\"password\":\"\"}");
+	if (error || !doc.containsKey("token") || !doc.containsKey("email")) {
+		strcpy(tmp_buffer, "{\"token\":\"\"}");
 		os.sopt_save(SOPT_FYTA_OPTS, tmp_buffer);
 	}
 
