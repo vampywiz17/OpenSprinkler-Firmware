@@ -18,7 +18,11 @@ static bool fyta_init = false;
 bool FytaApi::authenticate(const String &auth) {
     DEBUG_PRINTLN("FYTA AUTH");
 
+#if defined(ESP8266)
     if (auth.indexOf("token") >= 0) {
+#else
+    if (auth.find("token", 0) >= 0) {
+#endif
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, auth);
         if (!error && doc.containsKey("token")) {
