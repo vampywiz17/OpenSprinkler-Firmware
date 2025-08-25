@@ -16,13 +16,27 @@ static bool fyta_init = false;
  *
  */
 bool FytaApi::authenticate(const String &auth) {
-    authToken = "";
     DEBUG_PRINTLN("FYTA AUTH");
+
+    if (auth.indexOf("token") >= 0) {
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, auth);
+        if (!error && doc.containsKey("token")) {
+            authToken = doc["token"].as<String>();
+            if (authToken.length() > 10) {
+                DEBUG_PRINTLN("AUTH-TOKEN:");
+                DEBUG_PRINTLN(authToken.c_str());
+                return true;
+            }
+            authToken = "";
+        }   
+    }
 
 #if defined(ESP8266)
     http.begin(client, FYTA_URL_LOGIN);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("accept", "application/json");
+
     int res = http.POST(auth.c_str());
     if (res == 200) {
         JsonDocument responseDoc;
