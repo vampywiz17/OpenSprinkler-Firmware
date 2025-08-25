@@ -3005,7 +3005,7 @@ void server_fyta_get_credentials(OTF_PARAMS_DEF) {
 
 	JsonDocument doc;
 	DeserializationError error = deserializeJson(doc, os.sopt_load(SOPT_FYTA_OPTS));
-	if (error || !doc.containsKey("token") || !doc.containsKey("email")) {
+	if (error || (!doc.containsKey("token") && !doc.containsKey("email"))) {
 		strcpy(tmp_buffer, "{\"token\":\"\"}");
 		os.sopt_save(SOPT_FYTA_OPTS, tmp_buffer);
 	}
@@ -3017,11 +3017,6 @@ void server_fyta_get_credentials(OTF_PARAMS_DEF) {
         
         handle_return(HTML_OK);
         DEBUG_PRINTLN(F("server_fyta_get_credentials done"));
-}
-
-void write_base64(const char* output, uint outputLen, void *p1, void *p2) {
-	bfill.append(output, outputLen);
-	if (available_ether_buffer() <= 0) send_packet((const OTF::Request&)p1, (OTF::Response&)p2);
 }
 
 void server_fyta_query_plants(OTF_PARAMS_DEF) {
