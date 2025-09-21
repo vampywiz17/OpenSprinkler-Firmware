@@ -80,6 +80,7 @@
 const char *user_agent_string = "OpenSprinkler/" TOSTRING(OS_FW_VERSION) "#" TOSTRING(OS_FW_MINOR);
 
 void manual_start_program(unsigned char, unsigned char);
+void stop_program(unsigned char);
 void remote_http_callback(char*);
 
 // Small variations have been added to the timing values below
@@ -113,6 +114,7 @@ ulong flow_count = 0;
 unsigned char prev_flow_state = HIGH;
 float flow_last_gpm=0;
 int32_t flow_rt_period = -1;
+int16_t flow_sid = -1; // current flow sensor station id, -1 means not set
 uint32_t reboot_timer = 0;
 uint32_t ping_ok = 0;
 
@@ -141,10 +143,15 @@ void flow_poll() {
 	unsigned char curr_flow_state = digitalReadExt(PIN_SENSOR1);
 	if((!prev_flow_state) || curr_flow_state) { // only record on falling edge
 		prev_flow_state = curr_flow_state;
+		//#if defined(ENABLE_DEBUG)
+		//if (curr % 60 > 0)
+		//#endif
 		return;
 	}
 	prev_flow_state = curr_flow_state;
 	flow_count++;
+	DEBUG_PRINT("Flow poll: count=");
+	DEBUG_PRINTLN(flow_count);
 
 	/* RAH implementation of flow sensor */
 	if (flow_start == 0) { 
@@ -152,7 +159,11 @@ void flow_poll() {
 		flow_start = curr;
 	} // if first pulse, record time
 
+	#if defined(ENABLE_DEBUG)
+	if ((curr-flow_start)<900) {
+	#else
 	if ((curr-flow_start)<90000) {
+	#endif
 		flow_gallons=0;
 	} // wait 90 seconds before recording flow_begin
 	else {
@@ -184,6 +195,8 @@ void flow_poll() {
 	flow_stop = curr; // get time in ms for stop
 	flow_gallons++;  // increment gallon count for each poll
 	/* End of RAH implementation of flow sensor */
+	DEBUG_PRINT("Flow sensor: count=");
+	DEBUG_PRINTLN(flow_gallons);
 }
 
 #if defined(USE_DISPLAY)
@@ -1223,9 +1236,37 @@ void check_weather() {
  */
 void turn_on_station(unsigned char sid, ulong duration) {
 	// RAH implementation of flow sensor
+	if (flow_sid >= 0 && flow_sid != sid) {
+		// if another station is running, stop its flow measurement
+		if (flow_gallons > 1) {
+			if(flow_stop <= flow_begin) flow_last_gpm = 0;
+			else flow_last_gpm = (float) 60000 / (float)((flow_stop-flow_begin) / (flow_gallons - 1));
+		}// RAH calculate GPM, 1 pulse per gallon
+		else {flow_last_gpm = 0;}  // RAH if not one gallon (two pulses) measured then record 0 gpm
+
+		unsigned char qid = pd.station_qid[flow_sid];
+		// ignore request if trying to turn off a zone that's not even in the queue or no flow data to log
+		if (flow_last_gpm > 0 && qid < pd.nqueue)  {
+			RuntimeQueueStruct *q = pd.queue + qid;
+			time_os_t curr_time = os.now_tz();
+			if (curr_time >= q->st) {
+				// record lastrun log (only for non-master stations)
+				if (os.status.mas != (flow_sid + 1) && os.status.mas2 != (flow_sid + 1)) {
+					pd.lastrun.station = flow_sid;
+					pd.lastrun.program = q->pid;
+					pd.lastrun.duration = curr_time - q->st;
+					pd.lastrun.endtime = curr_time;		
+					write_log(LOGDATA_STATION, curr_time); // LOG_TODO
+					notif.add(NOTIFY_STATION_OFF, flow_sid, pd.lastrun.duration);
+					notif.add(NOTIFY_FLOW_ALERT, flow_sid, pd.lastrun.duration);
+				}
+			}
+		}
+	}
 	flow_start=0;
 	//Added flow_gallons reset to station turn on.
 	flow_gallons=0;  
+	flow_sid = sid;
 
 	if (os.set_station_bit(sid, 1, duration)) {
 		notif.add(NOTIFY_STATION_ON, sid, duration);
@@ -1294,28 +1335,32 @@ void turn_off_station(unsigned char sid, time_os_t curr_time, unsigned char shif
 	os.set_station_bit(sid, 0);
 
 	// RAH implementation of flow sensor
-	if (flow_gallons > 1) {
-		if(flow_stop <= flow_begin) flow_last_gpm = 0;
-		else flow_last_gpm = (float) 60000 / (float)((flow_stop-flow_begin) / (flow_gallons - 1));
-	}// RAH calculate GPM, 1 pulse per gallon
-	else {flow_last_gpm = 0;}  // RAH if not one gallon (two pulses) measured then record 0 gpm
+	if (flow_sid == sid) {
+		if (flow_gallons > 1) {
+			if(flow_stop <= flow_begin) flow_last_gpm = 0;
+			else flow_last_gpm = (float) 60000 / (float)((flow_stop-flow_begin) / (flow_gallons - 1));
+		}// RAH calculate GPM, 1 pulse per gallon
+		else {flow_last_gpm = 0;}  // RAH if not one gallon (two pulses) measured then record 0 gpm
+		flow_sid = -1;
 
-	// check if the current time is past the scheduled start time,
-	// because we may be turning off a station that hasn't started yet
-	if (curr_time >= q->st) {
-		// record lastrun log (only for non-master stations)
-		if (os.status.mas != (sid + 1) && os.status.mas2 != (sid + 1)) {
-			pd.lastrun.station = sid;
-			pd.lastrun.program = q->pid;
-			pd.lastrun.duration = curr_time - q->st;
-			pd.lastrun.endtime = curr_time;
+		// check if the current time is past the scheduled start time,
+		// because we may be turning off a station that hasn't started yet
+		if (curr_time >= q->st) {
+			// record lastrun log (only for non-master stations)
+			if (os.status.mas != (sid + 1) && os.status.mas2 != (sid + 1)) {
+				pd.lastrun.station = sid;
+				pd.lastrun.program = q->pid;
+				pd.lastrun.duration = curr_time - q->st;
+				pd.lastrun.endtime = curr_time;
 
-			// log station run
-			write_log(LOGDATA_STATION, curr_time); // LOG_TODO
-			notif.add(NOTIFY_STATION_OFF, sid, pd.lastrun.duration);
-			notif.add(NOTIFY_FLOW_ALERT, sid, pd.lastrun.duration);
+				// log station run
+				write_log(LOGDATA_STATION, curr_time); // LOG_TODO
+				notif.add(NOTIFY_STATION_OFF, sid, pd.lastrun.duration);
+				notif.add(NOTIFY_FLOW_ALERT, sid, pd.lastrun.duration);
+			}
 		}
 	}
+	else flow_last_gpm = 0; // RAH if not flow zone then record 0 gpm
 
 	// make necessary adjustments to sequential time stamps
 	int16_t station_delay = water_time_decode_signed(os.iopts[IOPT_STATION_DELAY_TIME]);
@@ -1503,6 +1548,40 @@ void reset_all_stations() {
 #endif
 }
 
+/**
+ * @brief Stop zones of a program
+ * pid > 0: stop program pid-1
+ * 
+ * @param pid 
+ */
+void stop_program(unsigned char pid) {
+	DEBUG_PRINT("Stopping program ");DEBUG_PRINTLN(pid);
+	//time_os_t curr_time = os.now_tz();
+	ProgramStruct prog;
+	if ((pid>0)&&(pid<255)) {
+		pd.read(pid-1, &prog);
+		unsigned char sid, bid, s;
+		for(sid=0;sid<os.nstations;sid++) {
+			if ((os.status.mas==sid+1) || (os.status.mas2==sid+1))
+				continue;
+			bid=sid>>3;
+			s=sid&0x07;
+			if (prog.durations[sid] && !(os.attrib_dis[bid]&(1<<s))) {
+				DEBUG_PRINT("Stopping station ");DEBUG_PRINTLN(sid);
+				// mark all stations of this program to have 0 duration
+				int qi;
+				RuntimeQueueStruct *q;
+				for(qi=pd.nqueue-1;qi>=0;qi--) {
+					q=pd.queue+qi;
+					if (q->pid==pid-1 || q->sid==sid) {
+						q->dur=0;
+					}
+				}
+			}
+		}
+	}
+	DEBUG_PRINTLN("Done");
+}
 
 /** Manually start a program
  * If pid==0, this is a test program (1 minute per station)

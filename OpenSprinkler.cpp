@@ -449,6 +449,7 @@ const char *OpenSprinkler::sopts[] = {
 	DEFAULT_DEVICE_NAME,
 	DEFAULT_EMPTY_STRING, // SOPT_STA_BSSID_CHL
 	DEFAULT_EMPTY_STRING, // SOPT_EMAIL_OPTS
+	DEFAULT_EMPTY_STRING, // SOPT_FYTA_OPTS
 };
 
 /** Weekday strings (stored in PROGMEM to reduce RAM usage) */

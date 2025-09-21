@@ -713,6 +713,8 @@ uint16_t parse_listdata(char **p) {
 }
 
 void manual_start_program(unsigned char, unsigned char);
+void stop_program(unsigned char);
+
 /** Manual start program
  * Command: /mp?pw=xxx&pid=xxx&uwt=xxx
  *
@@ -737,11 +739,19 @@ void server_manual_program(OTF_PARAMS_DEF) {
 
 	unsigned char uwt = 0;
 	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("uwt"), true)) {
-		if(tmp_buffer[0]=='1') uwt = 1;
+		uwt = atoi(tmp_buffer);
+	}
+
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("stop"), true)) {
+		int16_t stop = atoi(tmp_buffer);
+		if (stop) {
+			stop_program(pid+1);
+			handle_return(HTML_SUCCESS);
+		}
 	}
 
 	// reset all stations and prepare to run one-time program
-	reset_all_stations_immediate();
+	//reset_all_stations_immediate();
 
 	manual_start_program(pid+1, uwt);
 
@@ -859,8 +869,8 @@ void server_change_runonce(OTF_PARAMS_DEF) {
 			if (q) {
 				q->st = 0;
 				q->dur = water_time_resolve(dur);
-				q->pid = 254;
 				q->sid = sid;
+				q->pid = 254; // 254 is for run-once program
 				match_found = true;
 			}
 		}

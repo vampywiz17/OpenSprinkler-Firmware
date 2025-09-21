@@ -1399,7 +1399,7 @@ boolean send_rs485_command(uint32_t ip, uint16_t port, uint8_t address, uint16_t
   if (!client->connect(server, port)) {
     DEBUG_PRINT(server);
     DEBUG_PRINT(":");
-    DEBUG_PRINT(sensor->port);
+    DEBUG_PRINT(port);
     DEBUG_PRINT(" ");
     DEBUG_PRINTLN(F("failed."));
     client->stop();
