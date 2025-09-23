@@ -19,7 +19,7 @@ RUN make VERSION=${BUILD_VERSION}
 FROM base
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y libstdc++6 libmosquitto1 libi2c0 libmodbus5 libcurl4 libssl3 ca-certificates
+RUN apt-get update && apt-get install -y libstdc++6 libmosquittopp1 libi2c0 libmodbus5
 RUN rm -rf /var/lib/apt/lists/* 
 RUN mkdir /OpenSprinkler
 RUN mkdir -p /data/logs
