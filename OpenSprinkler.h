@@ -209,9 +209,9 @@ struct HTTPStationData {
 
 /** RS485 Station data structures - Must fit in STATION_SPECIAL_DATA_SIZE */
 struct ModbusStationData {
-	unsigned char ip[8];
-	unsigned char port[4];
-	// unsigned char device[2]; // not used on OSPi anymore
+	unsigned char ip[8];    // ESP8266 only
+	unsigned char port[4];  // ESP8266 only
+	unsigned char device[2]; // OSPI only, lineindex (0 first) in modbusDevs array / rs485 file
 	unsigned char address[2];
 	unsigned char register_on[4];
 	unsigned char data_on[4];
