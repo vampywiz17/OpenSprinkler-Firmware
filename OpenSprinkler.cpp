@@ -2269,7 +2269,9 @@ void OpenSprinkler::switch_httpstation(HTTPStationData *data, bool turnon, bool 
 	send_http_request(server, atoi(port), p, remote_http_callback, usessl);
 }
 
-#if defined(OSPI) || defined(ESP8266)
+#if defined(OSPI)
+extern boolean send_rs485_command(uint8_t device, uint8_t address, uint16_t reg,uint16_t data, bool isbit);
+#elif defined(ESP8266)
 extern boolean send_rs485_command(uint32_t ip, uint16_t port, uint8_t address, uint16_t reg,uint16_t data, bool isbit);
 #endif
 
@@ -2286,13 +2288,12 @@ void OpenSprinkler::switch_modbusStation(ModbusStationData *data, bool turnon) {
 	*/
 
 #if defined(OSPI)
-	uint32_t ip4 = hex2ulong(data->ip, sizeof(data->ip));
-	uint16_t port = (uint16_t)hex2ulong(data->port, sizeof(data->port));
-    uint8_t address = (uint8_t)hex2ulong(data->address, sizeof(data->address));
-    uint16_t reg = (uint16_t)hex2ulong(turnon ? data->register_on : data->register_off, sizeof(data->register_on));
-    uint16_t onoff = (uint16_t)hex2ulong(turnon ? data->data_on : data->data_off, sizeof(data->data_on));    
-    send_rs485_command(ip4, port, address, reg, onoff, true);
+	uint8_t device = (uint8_t)hex2ulong(data->device, sizeof(data->device));
+	uint8_t address = (uint8_t)hex2ulong(data->address, sizeof(data->address));
+	uint16_t reg = (uint16_t)hex2ulong(turnon ? data->register_on : data->register_off, sizeof(data->register_on));
+	uint16_t onoff = (uint16_t)hex2ulong(turnon ? data->data_on : data->data_off, sizeof(data->data_on));
 
+	send_rs485_command(device, address, reg, onoff, true);
 #elif defined(ESP8266)
 	uint32_t ip4 = hex2ulong(data->ip, sizeof(data->ip));
 	uint16_t port = (uint16_t)hex2ulong(data->port, sizeof(data->port));
