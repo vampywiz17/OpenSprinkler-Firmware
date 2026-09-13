@@ -99,7 +99,7 @@ extern volatile ulong flow_count;
 
 // Forward declarations from main.cpp (use correct types)
 extern void schedule_all_stations(time_os_t curr_time, unsigned char req_option);
-extern void manual_start_program(unsigned char pid, unsigned char uwt, unsigned char qo);
+extern void manual_start_program(unsigned char pid, unsigned char uwt, unsigned char qo, unsigned char usa = 255);
 extern void stop_program(unsigned char pid);
 extern void turn_off_station(unsigned char sid, time_os_t curr_time, unsigned char shift);
 extern bool useEth;  // true when connected via Ethernet

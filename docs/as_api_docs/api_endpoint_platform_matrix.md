@@ -72,6 +72,22 @@ The `_url_keys[]` array and the `urls[]` function-pointer array are kept in the 
 | 35 | `sh` | `server_sensorprog_types` | All | List sensor-program adjustment types |
 | 36 | `sx` | `server_sensorconfig_backup` | All | Export / import sensor configuration backup |
 
+### Expanded Sensor API — upstream 2.2.1(5) compatibility (no platform guard — all platforms)
+
+These endpoints use **three-letter** keys and are registered directly on the OTF router in `register_api_handlers()` (not through `_url_keys[]`). Implementation: `sensor_compat.cpp` (mapping) and the `server_*_sensor*` / `server_json_program_adj` handlers in `opensprinkler_server.cpp`. See `docs/docs/pro-api-endpoints.md` for the mapping to OpenSprinklerShop sensor types.
+
+| # | URL key | Handler function | Platform guard | Description |
+|---|---------|-----------------|----------------|-------------|
+| 36a | `jsn` | `server_json_sensors` | All | List sensors + latest readings (upstream format) |
+| 36b | `csn` | `server_change_sensor` | All | Add / modify sensor (upstream parameters) |
+| 36c | `dsn` | `server_delete_sensor` | All | Delete sensor (`uuid=-1`: all) |
+| 36d | `jsd` | `server_json_sensor_desc` | All | Sensor type / unit / argument descriptions |
+| 36e | `jsl` | `server_json_sensor_log` | All | Sensor log (json / csv / binary, paginated) |
+| 36f | `dsl` | `server_delete_sensor_log` | All | Delete sensor log records |
+| 36g | `jpa` | `server_json_program_adj` | All | Per-program weather / sensor adjustment factors |
+
+Related: `/jp` appends the program sensor-adjustment object, `/cp` accepts `snadj=`, `/mp` accepts `usa=`, `/ja` includes `sensors`.
+
 ### Debug endpoint (no platform guard)
 
 | # | URL key | Handler function | Platform guard | Description |

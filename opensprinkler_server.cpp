@@ -50,6 +50,7 @@ static void emit_monthly_water_backup_json(T &bfill) {
 #include <esp_heap_caps.h>
 #endif
 #include "sensors.h"
+#include "sensor_compat.h"
 #include "osinfluxdb.h"
 #include "ArduinoJson.hpp"
 #include "sensor_fyta.h"
@@ -862,7 +863,12 @@ uint16_t parse_listdata(char **p) {
 	return (uint16_t)atol(tmp_buffer);
 }
 
-void manual_start_program(unsigned char, unsigned char, unsigned char);
+void manual_start_program(unsigned char, unsigned char, unsigned char, unsigned char usa);
+// upstream "Expanded Sensor" API helpers (defined further below)
+static bool compat_parse_snadj(char *buf, uint8_t &flag, uint16_t &uuid, SensorPoint_t *points, uint8_t &n);
+static bool compat_parse_points(char *buf, SensorPoint_t *points, uint8_t &n, bool require_nonneg_y);
+static unsigned char compat_result_to_html(CompatResult r);
+void server_json_sensors_main(OTF_PARAMS_DEF);
 void stop_program(unsigned char);
 
 /** Manual start program
@@ -889,6 +895,13 @@ void server_manual_program(OTF_PARAMS_DEF) {
 		uwt = atoi(tmp_buffer);
 	}
 
+	// usa: upstream 2.2.1(5) "use sensor adjustment" (1/0). When absent the
+	// OpenSprinklerShop behaviour is kept: the adjustment is always applied.
+	unsigned char usa = 255;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("usa"), true)) {
+		usa = (tmp_buffer[0]=='1') ? 1 : 0;
+	}
+
 	unsigned char qo = QUEUE_OPTION_REPLACE;
 	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("qo"), true)) {
 		qo=(unsigned char)atoi(tmp_buffer);
@@ -909,7 +922,7 @@ void server_manual_program(OTF_PARAMS_DEF) {
 	// reset all stations and prepare to run one-time program
 	//reset_all_stations_immediate();
 
-	manual_start_program(pid+1, uwt, qo);
+	manual_start_program(pid+1, uwt, qo, usa);
 
 	handle_return(HTML_SUCCESS);
 }
@@ -1157,8 +1170,17 @@ void server_change_program(OTF_PARAMS_DEF) {
 		}
 	}
 
-
-
+	// snadj=flag,uuid,x0,y0,x1,y1,... (upstream 2.2.1(5) sensor adjustment).
+	// Absent: the existing adjustment is left untouched.
+	bool has_snadj = false;
+	uint8_t snadj_flag = 0;
+	uint16_t snadj_uuid = 0;
+	uint8_t snadj_n = 0;
+	SensorPoint_t snadj_points[SENSOR_MAX_POINTS];
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("snadj"), true)) {
+		if (!compat_parse_snadj(tmp_buffer, snadj_flag, snadj_uuid, snadj_points, snadj_n)) handle_return(HTML_DATA_FORMATERROR);
+		has_snadj = true;
+	}
 
 	if(!findKeyVal(FKV_SOURCE,tmp_buffer,TMP_BUFFER_SIZE, "v",false)) handle_return(HTML_DATA_MISSING);
 	char *pv = tmp_buffer+1;
@@ -1200,6 +1222,7 @@ void server_change_program(OTF_PARAMS_DEF) {
 		// Reject a new program when the filesystem is too full to store it safely (#295)
 		if(!config_space_for_new_entry(PROG_FILENAME)) handle_return(HTML_NOT_ENOUGH_SPACE);
 		if(!pd.add(&prog)) handle_return(HTML_DATA_OUTOFBOUND);
+		pid = pd.nprograms - 1;
 #if defined(ESP32) && defined(ENABLE_RAINMAKER)
 		if (auto *rm = OSRainMaker::get()) rm->sync_programs();
 #endif
@@ -1219,6 +1242,10 @@ void server_change_program(OTF_PARAMS_DEF) {
 #if defined(ESP32) && defined(ENABLE_RAINMAKER)
 		if (auto *rm = OSRainMaker::get()) rm->update_program_name((uint8_t)pid);
 #endif
+	}
+	if (has_snadj) {
+		CompatResult r = compat_snadj_apply((uint8_t)pid, snadj_flag, snadj_uuid, snadj_points, snadj_n);
+		if (r != COMPAT_OK) handle_return(compat_result_to_html(r));
 	}
 	handle_return(HTML_SUCCESS);
 }
@@ -1373,7 +1400,10 @@ void server_json_programs_main(OTF_PARAMS_DEF) {
 		// program name
 		strncpy(tmp_buffer, prog.name, PROGRAM_NAME_SIZE);
 		tmp_buffer[PROGRAM_NAME_SIZE] = 0;	// make sure the string ends
-		bfill.emit_p(PSTR("$S\",[$D,$D,$D]]"), tmp_buffer,prog.en_daterange,prog.daterange[0],prog.daterange[1]);
+		bfill.emit_p(PSTR("$S\",[$D,$D,$D],"), tmp_buffer,prog.en_daterange,prog.daterange[0],prog.daterange[1]);
+		// upstream 2.2.1(5): sensor adjustment object as 8th element ({} when none)
+		compat_emit_program_adjust_json(bfill, pid);
+		bfill.emit_p(PSTR("]"));
 		if(pid!=pd.nprograms-1) {
 			bfill.emit_p(PSTR(","));
 		}
@@ -2319,6 +2349,574 @@ void server_pause_queue(OTF_PARAMS_DEF) {
 	handle_return(HTML_SUCCESS);
 }
 
+// ===========================================================================
+// Upstream "Expanded Sensor" API (official firmware 2.2.1(5)):
+//   /jsn /csn /dsn /jsd /jsl /dsl /jpa  (+ "snadj" in /cp, /jp; "usa" in /mp)
+// Thin HTTP glue over the OpenSprinklerShop sensor subsystem; the mapping
+// lives in sensor_compat.cpp. Documented in docs/docs/pro-api-endpoints.md.
+// ===========================================================================
+
+static unsigned char compat_result_to_html(CompatResult r) {
+	switch (r) {
+		case COMPAT_OK:             return HTML_SUCCESS;
+		case COMPAT_ERR_MISSING:    return HTML_DATA_MISSING;
+		case COMPAT_ERR_FORMAT:     return HTML_DATA_FORMATERROR;
+		case COMPAT_ERR_NOSPACE:    return HTML_NOT_ENOUGH_SPACE;
+		case COMPAT_ERR_OUTOFBOUND:
+		default:                    return HTML_DATA_OUTOFBOUND;
+	}
+}
+
+static bool compat_parse_i32(const char *buf, int32_t &v) {
+	char *end;
+	long l = strtol(buf, &end, 10);
+	if (end == buf || *end != '\0') return false;
+	v = (int32_t)l;
+	return true;
+}
+
+static bool compat_parse_u32(const char *buf, uint32_t &v) {
+	char *end;
+	if (buf[0] == '-') return false;
+	unsigned long l = strtoul(buf, &end, 10);
+	if (end == buf || *end != '\0') return false;
+	v = (uint32_t)l;
+	return true;
+}
+
+static bool compat_parse_double(const char *buf, double &v) {
+	char *end;
+	v = strtod(buf, &end);
+	if (end == buf || *end != '\0') return false;
+	return isfinite(v);
+}
+
+// "x0,y0,x1,y1,..." with nondecreasing x; y >= 0 when require_nonneg_y
+static bool compat_parse_points(char *buf, SensorPoint_t *points, uint8_t &n, bool require_nonneg_y) {
+	char *ptr = buf;
+	char *end;
+	n = 0;
+	float last_x = -1e38f;
+	while (*ptr != '\0') {
+		if (n >= SENSOR_MAX_POINTS) return false;
+		float x = strtof(ptr, &end);
+		if (end == ptr || *end != ',') return false;
+		ptr = end + 1;
+		float y = strtof(ptr, &end);
+		if (end == ptr || (*end != ',' && *end != '\0')) return false;
+		if (!isfinite(x) || !isfinite(y) || x < last_x) return false;
+		if (require_nonneg_y && y < 0) return false;
+		points[n].x = x;
+		points[n].y = y;
+		n++;
+		last_x = x;
+		ptr = (*end == ',') ? end + 1 : end;
+	}
+	return true;
+}
+
+// "flag,uuid,x0,y0,x1,y1,..."
+static bool compat_parse_snadj(char *buf, uint8_t &flag, uint16_t &uuid, SensorPoint_t *points, uint8_t &n) {
+	char *ptr = buf;
+	char *end;
+	n = 0;
+	uuid = 0;
+	unsigned long v = strtoul(ptr, &end, 10);
+	if (end == ptr || (*end != ',' && *end != '\0') || v > 0xFF) return false;
+	flag = (uint8_t)v;
+	if (*end != ',') return true;
+	ptr = end + 1;
+	v = strtoul(ptr, &end, 10);
+	if (end == ptr || (*end != ',' && *end != '\0') || v > 0xFFFF) return false;
+	uuid = (uint16_t)v;
+	if (*end != ',') return true;
+	return compat_parse_points(end + 1, points, n, true);
+}
+
+struct CompatFlushCtx {
+	const OTF::Request *req;
+	OTF::Response *res;
+};
+
+static void compat_flush_cb(void *ctx) {
+	CompatFlushCtx *c = (CompatFlushCtx*)ctx;
+	if (available_ether_buffer() < 700) send_packet(*c->req, *c->res);
+}
+
+/** jsn: body of the sensor list ("sn":[...],"count":N}) */
+void server_json_sensors_main(OTF_PARAMS_DEF) {
+	bfill.emit_p(PSTR("\"sn\":["));
+	ulong now = os.now_tz();
+	uint count = 0;
+	for (auto it = sensors_iterate_begin(); ; ) {
+		SensorBase *s = sensors_iterate_next(it);
+		if (!s) break;
+		if (available_ether_buffer() < 700) send_packet(OTF_PARAMS);
+		if (count) bfill.emit_p(PSTR(","));
+		compat_emit_sensor_json(bfill, s, now);
+		count++;
+	}
+	bfill.emit_p(PSTR("],\"count\":$D}"), count);
+}
+
+/**
+ * jsn
+ * Get Expanded Sensors (upstream 2.2.1(5))
+ */
+void server_json_sensors(OTF_PARAMS_DEF) {
+	if(!api_begin(OTF_PARAMS)) return;
+	bfill.emit_p(PSTR("{"));
+	server_json_sensors_main(OTF_PARAMS);
+	handle_return(HTML_OK);
+}
+
+/**
+ * csn
+ * Add or change an Expanded Sensor (upstream 2.2.1(5))
+ * /csn?pw=xxx&[uuid=xxx|sid=xxx]&type=xxx&name=&min=&max=&interval=&unit=&flag=
+ *   Aggregate: children=uuid,scale,offset;...  action=
+ *   ADS1115:   pin= scale= offset= subtype= points=x0,y0,...
+ *   Weather:   action=      SystemInternal: metric=      OnboardDigital: input=
+ *   Native(5): ntype=<OpenSprinklerShop sensor type>
+ */
+void server_change_sensor(OTF_PARAMS_DEF) {
+	if(!process_password(OTF_PARAMS)) return;
+
+	CompatCsnParams p;
+	memset(&p, 0, sizeof(p));
+	int32_t iv;
+	uint32_t uv;
+	double dv;
+
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("uuid"), true)) {
+		if (!compat_parse_i32(tmp_buffer, iv)) handle_return(HTML_DATA_FORMATERROR);
+		if (iv == -1) p.is_new = true;
+		else {
+			if (iv < 1 || iv > 0xFFFF) handle_return(HTML_DATA_OUTOFBOUND);
+			if (!sensor_by_nr((uint)iv)) handle_return(HTML_DATA_OUTOFBOUND);
+			p.nr = (uint)iv;
+		}
+	} else if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("sid"), true)) {
+		if (!compat_parse_i32(tmp_buffer, iv)) handle_return(HTML_DATA_FORMATERROR);
+		if (iv == -1) p.is_new = true;
+		else {
+			SensorBase *s = (iv >= 0) ? compat_sensor_by_sid((uint)iv) : nullptr;
+			if (!s) handle_return(HTML_DATA_OUTOFBOUND);
+			p.nr = s->nr;
+		}
+	} else {
+		handle_return(HTML_DATA_MISSING);
+	}
+
+	if (!findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("type"), true)) handle_return(HTML_DATA_MISSING);
+	if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+	if (uv >= (uint32_t)CompatSensorType::MAX_VALUE) handle_return(HTML_DATA_OUTOFBOUND);
+	p.type = (CompatSensorType)uv;
+
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("name"), true)) {
+		strReplaceQuoteBackslash(tmp_buffer);
+		strncpy(p.name, tmp_buffer, COMPAT_NAME_LEN - 1);
+		p.name[COMPAT_NAME_LEN - 1] = 0;
+		p.has_name = true;
+	}
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("min"), true)) {
+		if (!compat_parse_double(tmp_buffer, dv)) handle_return(HTML_DATA_FORMATERROR);
+		p.min = dv; p.has_min = true;
+	}
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("max"), true)) {
+		if (!compat_parse_double(tmp_buffer, dv)) handle_return(HTML_DATA_FORMATERROR);
+		p.max = dv; p.has_max = true;
+	}
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("interval"), true)) {
+		if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+		if (uv < 1) handle_return(HTML_DATA_OUTOFBOUND);
+		p.interval = uv; p.has_interval = true;
+	}
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("unit"), true)) {
+		if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+		if (uv >= (uint32_t)CompatUnit::MAX_VALUE) handle_return(HTML_DATA_OUTOFBOUND);
+		p.unit = (CompatUnit)uv; p.has_unit = true;
+	}
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("flag"), true)) {
+		if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+		p.flag = (uint8_t)uv; p.has_flag = true;
+	}
+
+	// Aggregate
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("children"), true)) {
+		const char *ptr = tmp_buffer;
+		uint8_t i = 0;
+		while (*ptr != '\0') {
+			if (i >= COMPAT_CHILDREN) handle_return(HTML_DATA_FORMATERROR);
+			int d; float d1, d2;
+			if (sscanf(ptr, "%d,%f,%f", &d, &d1, &d2) != 3) handle_return(HTML_DATA_FORMATERROR);
+			p.child_uuid[i] = (d >= 1 && d <= 0xFFFF) ? (uint16_t)d : COMPAT_UUID_NONE;
+			p.child_scale[i] = d1;
+			p.child_offset[i] = d2;
+			i++;
+			while (*ptr != '\0' && *(ptr++) != ';') {}
+		}
+		p.nchildren = i; p.has_children = true;
+	}
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("action"), true)) {
+		if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+		if (uv > 0xFF) handle_return(HTML_DATA_OUTOFBOUND);
+		p.action = (uint8_t)uv; p.has_action = true;
+	}
+
+	// ADS1115
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("pin"), true)) {
+		if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+		if (uv < 1 || uv > 16) handle_return(HTML_DATA_OUTOFBOUND);
+		p.pin = (uint8_t)uv; p.has_pin = true;
+	}
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("scale"), true)) {
+		if (!compat_parse_double(tmp_buffer, dv)) handle_return(HTML_DATA_FORMATERROR);
+		p.scale = dv; p.has_scale = true;
+	}
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("offset"), true)) {
+		if (!compat_parse_double(tmp_buffer, dv)) handle_return(HTML_DATA_FORMATERROR);
+		p.offset = dv; p.has_offset = true;
+	}
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("subtype"), true)) {
+		if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+		if (uv >= (uint32_t)CompatAds1115Subtype::MAX_VALUE) handle_return(HTML_DATA_OUTOFBOUND);
+		p.subtype = (uint8_t)uv; p.has_subtype = true;
+	}
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("points"), true)) {
+		if (!compat_parse_points(tmp_buffer, p.points, p.npoints, false)) handle_return(HTML_DATA_FORMATERROR);
+		p.has_points = true;
+	}
+
+	// SystemInternal / OnboardDigital / Native
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("metric"), true)) {
+		if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+		if (uv >= (uint32_t)CompatSystemMetric::MAX_VALUE) handle_return(HTML_DATA_OUTOFBOUND);
+		p.metric = (uint8_t)uv; p.has_metric = true;
+	}
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("input"), true)) {
+		if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+		if (uv >= (uint32_t)CompatOnboardInput::MAX_VALUE) handle_return(HTML_DATA_OUTOFBOUND);
+		p.input = (uint8_t)uv; p.has_input = true;
+	}
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("ntype"), true)) {
+		if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+		if (uv < 1 || uv > 0xFFFF) handle_return(HTML_DATA_OUTOFBOUND);
+		p.ntype = uv; p.has_ntype = true;
+	}
+
+	uint nr = 0;
+	CompatResult r = compat_change_sensor(p, &nr);
+	handle_return(compat_result_to_html(r));
+}
+
+/**
+ * dsn
+ * Delete an Expanded Sensor: /dsn?pw=xxx&[uuid=xxx|sid=xxx]  (-1 = all)
+ */
+void server_delete_sensor(OTF_PARAMS_DEF) {
+	if(!process_password(OTF_PARAMS)) return;
+	int32_t iv;
+	uint nr = 0;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("uuid"), true)) {
+		if (!compat_parse_i32(tmp_buffer, iv)) handle_return(HTML_DATA_FORMATERROR);
+		if (iv != -1) {
+			if (iv < 1 || iv > 0xFFFF) handle_return(HTML_DATA_OUTOFBOUND);
+			nr = (uint)iv;
+		}
+	} else if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("sid"), true)) {
+		if (!compat_parse_i32(tmp_buffer, iv)) handle_return(HTML_DATA_FORMATERROR);
+		if (iv != -1) {
+			SensorBase *s = (iv >= 0) ? compat_sensor_by_sid((uint)iv) : nullptr;
+			if (!s) handle_return(HTML_DATA_OUTOFBOUND);
+			nr = s->nr;
+		}
+	} else {
+		handle_return(HTML_DATA_MISSING);
+	}
+	CompatResult r = compat_delete_sensor(nr);   // handle_return() evaluates its argument twice
+	handle_return(compat_result_to_html(r));
+}
+
+/**
+ * jsd
+ * Get Expanded Sensor descriptions (types, units, enums, common args, flags)
+ */
+void server_json_sensor_desc(OTF_PARAMS_DEF) {
+	if(!api_begin(OTF_PARAMS)) return;
+	bfill.emit_p(PSTR("{"));
+	CompatFlushCtx ctx = { &req, &res };
+	compat_emit_sensor_desc_json(bfill, compat_flush_cb, &ctx);
+	handle_return(HTML_OK);
+}
+
+/**
+ * jpa
+ * Per-program weather (wa), sensor (sa) and total (ta) adjustment factors.
+ */
+void server_json_program_adj(OTF_PARAMS_DEF) {
+	if(!api_begin(OTF_PARAMS)) return;
+	bfill.emit_p(PSTR("{\"jpa\":["));
+	ProgramStruct prog;
+	char nb[3][24];
+	for (unsigned char pid = 0; pid < pd.nprograms; pid++) {
+		pd.read(pid, &prog);
+		double wa = prog.use_weather ? os.iopts[IOPT_WATER_PERCENTAGE] / 100.0 : 1.0;
+		double sa = calc_sensor_watering(pid);
+		snprintf(nb[0], sizeof(nb[0]), "%g", wa);
+		snprintf(nb[1], sizeof(nb[1]), "%g", sa);
+		snprintf(nb[2], sizeof(nb[2]), "%g", wa * sa);
+		if (pid) bfill.emit_p(PSTR(","));
+		bfill.emit_p(PSTR("{\"wa\":$S,\"sa\":$S,\"ta\":$S}"), nb[0], nb[1], nb[2]);
+		if (available_ether_buffer() < 128) send_packet(OTF_PARAMS);
+	}
+	// RuntimeQueueStruct::dur is 16 bit: effective station runtime cap
+	bfill.emit_p(PSTR("],\"maxrt\":$L}"), (ulong)65535);
+	handle_return(HTML_OK);
+}
+
+// first log index whose timestamp is >= t (log is chronological)
+static ulong compat_log_lower_bound(ulong total, ulong t) {
+	ulong lo = 0, hi = total;
+	SensorLog_t rec;
+	while (lo < hi) {
+		ulong mid = lo + (hi - lo) / 2;
+		sensorlog_load(LOG_STD, mid, &rec);
+		if (rec.time < t) lo = mid + 1; else hi = mid;
+	}
+	return lo;
+}
+
+// first log index whose timestamp is > t
+static ulong compat_log_upper_bound(ulong total, ulong t) {
+	ulong lo = 0, hi = total;
+	SensorLog_t rec;
+	while (lo < hi) {
+		ulong mid = lo + (hi - lo) / 2;
+		sensorlog_load(LOG_STD, mid, &rec);
+		if (rec.time <= t) lo = mid + 1; else hi = mid;
+	}
+	return lo;
+}
+
+/**
+ * jsl
+ * Get Expanded Sensor log (upstream 2.2.1(5))
+ * /jsl?pw=xxx&[uuid=xxx|sid=xxx]&count=xxx&before=xxx&after=xxx&cursor=xxx&fmt=json|csv|binary&page=1
+ * Records: json [[uuid,ts,value],...]; csv uuid,timestamp,value; binary
+ * packed {uint32 ts, float value, uint16 uuid}. Reads the standard sensor log
+ * (LOG_STD); cursor/count address physical record slots of that log.
+ */
+void server_json_sensor_log(OTF_PARAMS_DEF) {
+	if(!process_password(OTF_PARAMS)) return;
+
+	int32_t iv;
+	uint32_t uv;
+	ulong total_slots = sensorlog_size(LOG_STD);
+
+	bool page_mode = false;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("page"), true)) {
+		if (strcmp(tmp_buffer, "1") == 0) page_mode = true;
+		else if (strcmp(tmp_buffer, "0") != 0) handle_return(HTML_DATA_FORMATERROR);
+	}
+
+	ulong max_count = 100;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("count"), true)) {
+		if (strcmp(tmp_buffer, "max") == 0 || strcmp(tmp_buffer, "all") == 0) {
+			max_count = total_slots;
+		} else {
+			if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+			if (uv == 0) handle_return(HTML_DATA_OUTOFBOUND);
+			max_count = uv;
+		}
+	}
+	if (max_count > total_slots) max_count = total_slots;
+
+	ulong cursor = 0;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("cursor"), true)) {
+		if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+		if (uv > total_slots) handle_return(HTML_DATA_OUTOFBOUND);
+		cursor = uv;
+	}
+
+	ulong before = 0xFFFFFFFFUL;
+	bool has_before = false;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("before"), true)) {
+		if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+		if (uv == 0) handle_return(HTML_DATA_OUTOFBOUND);
+		before = uv; has_before = true;
+	}
+	ulong after = 0;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("after"), true)) {
+		if (!compat_parse_u32(tmp_buffer, uv)) handle_return(HTML_DATA_FORMATERROR);
+		if ((ulong)uv >= before) handle_return(HTML_DATA_OUTOFBOUND);
+		after = uv;
+	}
+
+	int32_t target_uuid = -1;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("uuid"), true)) {
+		if (!compat_parse_i32(tmp_buffer, iv)) handle_return(HTML_DATA_FORMATERROR);
+		if (iv != -1 && (iv < 1 || iv > 0xFFFF)) handle_return(HTML_DATA_OUTOFBOUND);
+		target_uuid = iv;
+	} else if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("sid"), true)) {
+		if (!compat_parse_i32(tmp_buffer, iv)) handle_return(HTML_DATA_FORMATERROR);
+		if (iv != -1) {
+			SensorBase *s = (iv >= 0) ? compat_sensor_by_sid((uint)iv) : nullptr;
+			if (!s) handle_return(HTML_DATA_OUTOFBOUND);
+			target_uuid = (int32_t)s->nr;
+		}
+	}
+
+	enum { FMT_JSON, FMT_CSV, FMT_BINARY } logfmt = FMT_JSON;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("fmt"), true)) {
+		if      (strcmp(tmp_buffer, "csv") == 0)    logfmt = FMT_CSV;
+		else if (strcmp(tmp_buffer, "binary") == 0) logfmt = FMT_BINARY;
+		else if (strcmp(tmp_buffer, "json") != 0)   handle_return(HTML_DATA_FORMATERROR);
+	}
+
+	// time window in physical slots
+	ulong window_start = 0;
+	ulong window_end = total_slots;
+	if (after && total_slots) window_start = compat_log_lower_bound(total_slots, after);
+	if (has_before && total_slots) window_end = compat_log_upper_bound(total_slots, before);
+	if (window_start > window_end) window_start = window_end;
+
+	ulong scan = cursor;
+	if (scan < window_start) scan = window_start;
+	if (scan > window_end) scan = window_end;
+	ulong page_end = window_end;
+	if (page_mode) {
+		ulong remaining = window_end - scan;
+		page_end = scan + (max_count < remaining ? max_count : remaining);
+	}
+
+	rewind_ether_buffer();
+	res.writeStatus(200, F("OK"));
+	res.writeHeader(F("Content-Type"), logfmt == FMT_BINARY ? F("application/octet-stream") :
+	                                   logfmt == FMT_CSV ? F("text/csv") : F("application/json"));
+	res.writeHeader(F("Access-Control-Allow-Origin"), F("*"));
+	res.writeHeader(F("Cache-Control"), F("max-age=0, no-cache, no-store, must-revalidate"));
+	res.writeHeader(F("Connection"), F("close"));
+	if (page_mode) {
+		res.writeHeader(F("X-OS-Next-Cursor"), (int)page_end);
+		res.writeHeader(F("X-OS-Total-Slots"), (int)total_slots);
+		res.writeHeader(F("X-OS-Window-Start"), (int)window_start);
+		res.writeHeader(F("X-OS-Window-End"), (int)window_end);
+		res.writeHeader(F("X-OS-Page-Done"), page_end >= window_end ? 1 : 0);
+		res.writeHeader(F("Access-Control-Expose-Headers"),
+			F("X-OS-Next-Cursor, X-OS-Total-Slots, X-OS-Window-Start, X-OS-Window-End, X-OS-Page-Done"));
+	}
+	if (logfmt == FMT_CSV)
+		res.writeHeader(F("Content-Disposition"), F("attachment; filename=\"sensor_log.csv\""));
+
+	if (logfmt == FMT_JSON) bfill.emit_p(PSTR("["));
+	if (logfmt == FMT_CSV)  bfill.emit_p(PSTR("uuid,timestamp,value\n"));
+
+#if defined(ESP8266)
+	const int block = 32;
+#else
+	const int block = 128;
+#endif
+#if defined(ESP32) && defined(BOARD_HAS_PSRAM)
+	SensorLog_t *buf = (SensorLog_t*)heap_caps_malloc(sizeof(SensorLog_t) * block, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+	SensorLog_t *buf = (SensorLog_t*)malloc(sizeof(SensorLog_t) * block);
+#endif
+	if (!buf) handle_return(HTML_DATA_OUTOFBOUND);
+
+	SensorBase *sensor = NULL;
+	ulong idx = scan;
+	ulong count = 0;
+	bool done = false;
+	while (!done && idx < page_end) {
+		int want = (page_end - idx) < (ulong)block ? (int)(page_end - idx) : block;
+		int n = sensorlog_load2(LOG_STD, idx, want, buf);
+		if (n <= 0) break;
+#if defined(USE_OTF) && defined(ARDUINO)
+		delay(1);
+#endif
+		for (int i = 0; i < n; i++) {
+			idx++;
+			SensorLog_t &rec = buf[i];
+			if (rec.nr == 0 || rec.time == 0) continue;            // deleted / empty slot
+			if (target_uuid > -1 && rec.nr != (uint)target_uuid) continue;
+			if (rec.time < after || rec.time > before) continue;
+			if (!sensor || sensor->nr != rec.nr) sensor = sensor_by_nr(rec.nr);
+			if (sensor && sensor->log_barrier && rec.time < sensor->log_barrier) continue;
+
+			switch (logfmt) {
+				case FMT_JSON: {
+					char vb[24];
+					snprintf(vb, sizeof(vb), "%g", rec.data);
+					bfill.emit_p(count ? PSTR(",[$D,$L,$S]") : PSTR("[$D,$L,$S]"), rec.nr, rec.time, vb);
+					break;
+				}
+				case FMT_CSV: {
+					char vb[24];
+					snprintf(vb, sizeof(vb), "%g", rec.data);
+					bfill.emit_p(PSTR("$D,$L,$S\n"), rec.nr, rec.time, vb);
+					break;
+				}
+				case FMT_BINARY: {
+					struct __attribute__((packed)) { uint32_t ts; float value; uint16_t uuid; } r;
+					r.ts = (uint32_t)rec.time;
+					r.value = (float)rec.data;
+					r.uuid = (uint16_t)rec.nr;
+					bfill.append((const char*)&r, sizeof(r));
+					break;
+				}
+			}
+			count++;
+			if (available_ether_buffer() < 64) send_packet(OTF_PARAMS);
+			if (!page_mode && count >= max_count) { done = true; break; }
+		}
+	}
+	free(buf);
+
+	if (logfmt == FMT_JSON) bfill.emit_p(PSTR("]"));
+	handle_return(HTML_OK);
+}
+
+/**
+ * dsl
+ * Delete Expanded Sensor log records: /dsl?pw=xxx&uuid=xxx[&page=1&cursor=&count=]
+ * uuid=-1 clears the whole sensor log. The per-sensor delete is done in one
+ * pass (our log clear is block based), so a paginated request completes
+ * immediately (done=1).
+ */
+void server_delete_sensor_log(OTF_PARAMS_DEF) {
+	if(!process_password(OTF_PARAMS)) return;
+	int32_t uuid;
+	if (!findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("uuid"), true)) handle_return(HTML_DATA_MISSING);
+	if (!compat_parse_i32(tmp_buffer, uuid)) handle_return(HTML_DATA_FORMATERROR);
+	if (uuid != -1 && (uuid < 1 || uuid > 0xFFFF)) handle_return(HTML_DATA_OUTOFBOUND);
+
+	bool page_mode = false;
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("page"), true)) {
+		if (strcmp(tmp_buffer, "1") == 0) page_mode = true;
+		else if (strcmp(tmp_buffer, "0") != 0) handle_return(HTML_DATA_FORMATERROR);
+	}
+
+	if (uuid == -1) {
+		if (page_mode) handle_return(HTML_DATA_FORMATERROR);
+		sensorlog_clear_all();
+		handle_return(HTML_SUCCESS);
+	}
+
+	ulong total = sensorlog_size(LOG_STD);
+	ulong deleted = sensorlog_clear_sensor((uint)uuid, LOG_STD, false, 0, false, 0, 0, 0);
+	sensorlog_clear_sensor((uint)uuid, LOG_WEEK, false, 0, false, 0, 0, 0);
+	sensorlog_clear_sensor((uint)uuid, LOG_MONTH, false, 0, false, 0, 0, 0);
+
+	if (!page_mode) handle_return(HTML_SUCCESS);
+
+	rewind_ether_buffer();
+	print_header(OTF_PARAMS);
+	bfill.emit_p(PSTR("{\"result\":1,\"next\":$L,\"total\":$L,\"deleted\":$L,\"done\":1}"), total, total, deleted);
+	handle_return(HTML_OK);
+}
+
+
 /** Output all JSON data, including jc, jp, jo, js, jn */
 void server_json_all(OTF_PARAMS_DEF) {
 	if(!process_password(OTF_PARAMS,true)) return;
@@ -2338,6 +2936,9 @@ void server_json_all(OTF_PARAMS_DEF) {
 	send_packet(OTF_PARAMS);
 	bfill.emit_p(PSTR(",\"stations\":{"));
 	server_json_stations_main(OTF_PARAMS);
+	send_packet(OTF_PARAMS);
+	bfill.emit_p(PSTR(",\"sensors\":{"));
+	server_json_sensors_main(OTF_PARAMS);
 	bfill.emit_p(PSTR("}"));
 	handle_return(HTML_OK);
 }
@@ -4718,6 +5319,22 @@ void server_sensorprog_config(OTF_PARAMS_DEF) {
 	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("order"), true))
 		obj["order"] = strtoul(tmp_buffer, NULL, 0);
 
+	// points=x0,y0,x1,y1,... (PROG_PIECEWISE curve, nondecreasing x, y = factor)
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("points"), true)) {
+		SensorPoint_t pts[SENSOR_MAX_POINTS];
+		uint8_t n = 0;
+		if (!compat_parse_points(tmp_buffer, pts, n, true)) handle_return(HTML_DATA_FORMATERROR);
+		if (type == PROG_PIECEWISE && n < 2) handle_return(HTML_DATA_MISSING);
+		ArduinoJson::JsonArray arr = obj["points"].to<ArduinoJson::JsonArray>();
+		for (uint8_t i = 0; i < n; i++) {
+			ArduinoJson::JsonArray pt = arr.add<ArduinoJson::JsonArray>();
+			pt.add(pts[i].x);
+			pt.add(pts[i].y);
+		}
+	} else if (type == PROG_PIECEWISE) {
+		handle_return(HTML_DATA_MISSING);
+	}
+
 	int ret = prog_adjust_define(obj);
 	ret = ret == HTTP_RQT_SUCCESS ? HTML_SUCCESS :
 	      (ret == HTTP_RQT_NOT_ENOUGH_SPACE ? HTML_NOT_ENOUGH_SPACE : HTML_DATA_MISSING);
@@ -4852,6 +5469,7 @@ static const int sensor_types[] = {
 	SENSOR_THERM200,
 	SENSOR_AQUAPLUMB,
 	SENSOR_USERDEF,
+	SENSOR_ANALOG_PIECEWISE,
 #endif
 #if defined ADS1115||PCF8591
 	SENSOR_OSPI_ANALOG,
@@ -4862,6 +5480,7 @@ static const int sensor_types[] = {
 #if defined (OSPI) || defined(ESP32)
 	SENSOR_INTERNAL_TEMP,
 #endif
+	SENSOR_ONBOARD_DIGITAL,
 
 #if defined(ESP8266) || defined(ESP32) || defined(OSPI)
     SENSOR_FYTA_MOISTURE,
@@ -4887,6 +5506,8 @@ static const int sensor_types[] = {
 	SENSOR_GROUP_MAX,
 	SENSOR_GROUP_AVG,
 	SENSOR_GROUP_SUM,
+	SENSOR_GROUP_MEDIAN,
+	SENSOR_GROUP_RANGE,
 #if defined(ESP8266) || defined(ESP32)
 	SENSOR_FREE_MEMORY,
 	SENSOR_FREE_STORE,
@@ -4920,6 +5541,7 @@ static const char* sensor_names[] = {
 	"ASB - Vegetronix AquaPlumb",
 
 	"ASB - user defined sensor",
+	"ASB - piecewise linear curve",
 #endif
 #if defined ADS1115||PCF8591
 	"OSPi analog input - voltage mode 0..3.3V",
@@ -4933,6 +5555,7 @@ static const char* sensor_names[] = {
 #if defined(ESP32)
 	"Internal ESP32 temperature",
 #endif
+	"Onboard digital input SN1/SN2",
 #if defined(ESP8266) || defined(ESP32) || defined(OSPI)
 	"FYTA moisture sensor",
 	"FYTA temperature sensor",
@@ -4958,6 +5581,8 @@ static const char* sensor_names[] = {
 	"Sensor group with max value",
 	"Sensor group with avg value",
 	"Sensor group with sum value",
+	"Sensor group with median value",
+	"Sensor group with range (max-min) value",
 #if defined(ESP8266) || defined(ESP32)
 	"Free Memory",
 	"Free Storage",
@@ -5289,6 +5914,18 @@ void server_sensorprog_calc(OTF_PARAMS_DEF) {
 		handle_return(HTML_DATA_MISSING);
 	progAdj.max = atof(tmp_buffer); // Max value
 
+	if (findKeyVal(FKV_SOURCE, tmp_buffer, TMP_BUFFER_SIZE, PSTR("points"), true)) {
+		SensorPoint_t pts[SENSOR_MAX_POINTS];
+		uint8_t n = 0;
+		if (!compat_parse_points(tmp_buffer, pts, n, true)) handle_return(HTML_DATA_FORMATERROR);
+		progAdj.setPoints(pts, n);
+		if (n >= 2) {
+			// preview range from the curve when min/max were not given explicitly
+			if (progAdj.min == progAdj.max) { progAdj.min = pts[0].x; progAdj.max = pts[n - 1].x; }
+		}
+	}
+	if (progAdj.type == PROG_PIECEWISE && progAdj.pw_n < 2) handle_return(HTML_DATA_MISSING);
+
 	unsigned char unitId = getSensorUnitId(sensor);
 
 	int diff = progAdj.max-progAdj.min;
@@ -5334,6 +5971,7 @@ const int prog_types[] = {
 	PROG_DIGITAL_MIN,
 	PROG_DIGITAL_MAX,
 	PROG_DIGITAL_MINMAX,
+	PROG_PIECEWISE,
 };
 
 const char* prog_names[] = {
@@ -5342,6 +5980,7 @@ const char* prog_names[] = {
 	"Digital under min",
 	"Digital over max",
 	"Digital under min or over max",
+	"Piecewise linear curve",
 };
 
 /**
@@ -7113,6 +7752,14 @@ static void register_api_handlers(bool with_platform_handlers) {
 		uri[2]=pgm_read_byte(_url_keys+2*i+1);
 		otf->on(uri, server_api_dispatch);
 	}
+	// three-letter endpoints of the upstream "Expanded Sensor" API (2.2.1(5))
+	otf->on("/jsn", server_json_sensors);
+	otf->on("/csn", server_change_sensor);
+	otf->on("/dsn", server_delete_sensor);
+	otf->on("/jsl", server_json_sensor_log);
+	otf->on("/dsl", server_delete_sensor_log);
+	otf->on("/jsd", server_json_sensor_desc);
+	otf->on("/jpa", server_json_program_adj);
 }
 
 void server_api_dispatch(OTF_PARAMS_DEF) {

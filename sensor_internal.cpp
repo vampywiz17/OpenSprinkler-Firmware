@@ -40,6 +40,20 @@ int InternalSensor::read(unsigned long time) {
   if (!this->flags.enable) return HTTP_RQT_NOT_RECEIVED;
 
   switch (this->type) {
+    case SENSOR_ONBOARD_DIGITAL: {
+      // Debounced active state of the onboard sensor inputs (SN1 = id 0, SN2 = id 1)
+      bool active;
+      switch (this->id) {
+        case 0: active = os.status.sensor1_active; break;
+        case 1: active = os.status.sensor2_active; break;
+        default: return HTTP_RQT_NOT_RECEIVED;
+      }
+      this->last_read = time;
+      this->last_native_data = active ? 1 : 0;
+      this->last_data = active ? 1.0 : 0.0;
+      this->flags.data_ok = true;
+      return HTTP_RQT_SUCCESS;
+    }
 #if defined(ESP8266) || defined(ESP32)
     case SENSOR_FREE_MEMORY: {
       uint32_t fm = freeMemory();
@@ -120,6 +134,8 @@ const char* InternalSensor::getUnit() const {
       return "KB"; 
     case SENSOR_INTERNAL_TEMP:
       return "°C";
+    case SENSOR_ONBOARD_DIGITAL:
+      return "";
   }
   return SensorBase::getUnit();
 }
@@ -131,6 +147,8 @@ unsigned char InternalSensor::getUnitId() const {
       return UNIT_USERDEF;
     case SENSOR_INTERNAL_TEMP:
       return UNIT_DEGREE;
+    case SENSOR_ONBOARD_DIGITAL:
+      return UNIT_NONE;
   }
   return SensorBase::getUnitId();
 }

@@ -73,6 +73,8 @@ static bool ble_uuid_extract_16bit(const char* uuid_in, uint16_t* out_uuid16);
 static bool ble_initialized = false;
 static BLEScan* pBLEScan = nullptr;
 static constexpr size_t BLE_DISCOVERED_MAX = 128;
+// Legacy advertising: 31 bytes ADV + 31 bytes scan response
+static constexpr size_t BLE_ADV_PAYLOAD_MAX = 62;
 
 // Background passive scan: runs continuously to catch broadcast sensors (Govee, Xiaomi)
 // DISABLED FOR WIFI STABILITY: Background scans were interrupting WiFi TCP/IP operations at LWIP level,
@@ -85,6 +87,15 @@ static const uint32_t BG_SCAN_DURATION_NORMAL  = 5;     // DISABLED: 0 seconds (
 static const uint32_t BG_SCAN_DURATION_CONTEND = 0;     // DISABLED: 0 seconds
 static const uint32_t BG_SCAN_RESTART_MS = 20000;  // Never restart background scan
 static const uint32_t BG_SCAN_FAIL_BACKOFF_MS = 5000;
+// Ethernet+Zigbee (ESP32-C5): a continuous background scan triggers repeated GAP
+// start failures (rc=519) and burns scarce internal RAM, so it used to be skipped
+// entirely in that mode — which left broadcast sensors (Govee & co) permanently
+// without data (data_ok=0 while the last value kept being displayed). Scan in
+// short bursts on a slow duty cycle instead.
+static const uint32_t BG_SCAN_DURATION_ZB_ETH = 3;        // seconds per burst
+static const uint32_t BG_SCAN_RESTART_MS_ZB_ETH = 60000;  // 1 min between bursts
+// Delay until the next background scan; set by ble_bg_scan_start() per mode.
+static uint32_t bg_scan_restart_ms = BG_SCAN_RESTART_MS;
 
 
 // User-requested discovery scan (active, high duty cycle)
@@ -141,7 +152,7 @@ static volatile uint32_t ble_dbg_lock_timeout = 0;
 // Background scan completion callback
 static void ble_bg_scan_complete_cb(BLEScanResults results) {
     bg_scan_active = false;
-    bg_scan_restart_at = millis() + BG_SCAN_RESTART_MS;
+    bg_scan_restart_at = millis() + bg_scan_restart_ms;
     zigbee_coex_yield_for_ble(false);  // restore Zigbee priority
 }
 
@@ -175,30 +186,37 @@ static void ble_bg_scan_start() {
     uint32_t now = millis();
     if ((int32_t)(now - bg_scan_fail_backoff_until) < 0) return;
 
+    uint32_t scan_duration = BG_SCAN_DURATION_NORMAL;
+    bg_scan_restart_ms = BG_SCAN_RESTART_MS;
+
 #if defined(ESP32C5)
-    // In Ethernet+Zigbee mode, continuous BLE background scanning causes
-    // repeated GAP start failures (rc=519) and burns scarce INTERNAL RAM.
-    // Keep BLE stack available for explicit user scans/GATT only.
+    // In Ethernet+Zigbee mode both radios share the 2.4 GHz front end: scan in
+    // short bursts with long pauses instead of a near-continuous scan, so the
+    // GAP layer keeps up (rc=519) while broadcast sensors still get fresh data.
     if (useEth && ieee802154_is_zigbee()) {
-        bg_scan_restart_at = now + 30000;
-        return;
+        scan_duration = BG_SCAN_DURATION_ZB_ETH;
+        bg_scan_restart_ms = BG_SCAN_RESTART_MS_ZB_ETH;
     }
 #endif
+
+    if (scan_duration == 0) return;  // Background scanning disabled
+    // NOTE: duration=0 in NimBLE means INFINITE scan, NOT "no scan".
+    // Always guard with this check before calling pBLEScan->start().
 
     pBLEScan->setActiveScan(false);   // Passive: no SCAN_REQ overhead
     pBLEScan->setInterval(320);       // 200ms interval
     pBLEScan->setWindow(160);         // 100ms window → 50% duty cycle
     pBLEScan->clearResults();
 
-    uint32_t scan_duration = BG_SCAN_DURATION_NORMAL;
-    if (scan_duration == 0) return;  // Background scanning disabled (BG_SCAN_DURATION_NORMAL=0)
-    // NOTE: duration=0 in NimBLE means INFINITE scan, NOT "no scan".
-    // Always guard with this check before calling pBLEScan->start().
     zigbee_coex_yield_for_ble(true);   // lower Zigbee PTI during BLE scan
     bool scan_started = pBLEScan->start(scan_duration, ble_bg_scan_complete_cb, false);
     if (!scan_started) {
         zigbee_coex_yield_for_ble(false);
-        bg_scan_fail_backoff_until = now + BG_SCAN_FAIL_BACKOFF_MS;
+        // Back off at least one full scan cycle so a failing controller is not
+        // hammered every few seconds.
+        uint32_t backoff = (bg_scan_restart_ms > BG_SCAN_FAIL_BACKOFF_MS)
+                             ? bg_scan_restart_ms : BG_SCAN_FAIL_BACKOFF_MS;
+        bg_scan_fail_backoff_until = now + backoff;
         bg_scan_restart_at = bg_scan_fail_backoff_until;
         return;
     }
@@ -876,13 +894,87 @@ static bool ble_is_govee_type(BLESensorType type) {
            type == BLE_TYPE_GOVEE_MEAT;
 }
 
-static bool ble_decode_raw_service_data_ec88(BLEAdvertisedDevice& advertisedDevice,
-                                             const char* device_name,
-                                             float* adv_temp, float* adv_hum,
-                                             uint8_t* adv_battery, BLESensorType* sensor_type,
-                                             bool* saw_ec88_service) {
-    const uint8_t* payload = advertisedDevice.getPayload();
-    size_t payload_len = advertisedDevice.getPayloadLength();
+/**
+ * @brief Decode a Govee value block (service-data or manufacturer-data payload
+ *        with the UUID / company id already stripped off).
+ */
+static bool ble_decode_govee_block(uint16_t id, const uint8_t* data, size_t len,
+                                   const char* device_name,
+                                   float* adv_temp, float* adv_hum,
+                                   uint8_t* adv_battery, BLESensorType* sensor_type) {
+    if (!data || len == 0) return false;
+
+    // Direct decode first
+    if (govee_decode_adv_data(id, data, len, device_name,
+                              adv_temp, adv_hum, adv_battery, sensor_type)) {
+        return true;
+    }
+
+    // Fallback for H5075-like payloads where the block contains extra leading
+    // bytes before the 6-byte Govee value block.
+    if (govee_detect_type_from_name(device_name) == BLE_TYPE_GOVEE_H5075 && len >= 6) {
+        for (size_t off = 0; off + 6 <= len && off < 10; off++) {
+            float t = 0, h = 0;
+            uint8_t b = 0;
+            if (govee_decode_h5075(data + off, 6, &t, &h, &b)) {
+                // Plausibility bounds
+                if (t > -40.0f && t < 85.0f && h >= 0.0f && h <= 100.0f) {
+                    *adv_temp = t;
+                    *adv_hum = h;
+                    *adv_battery = b;
+                    if (sensor_type) *sensor_type = BLE_TYPE_GOVEE_H5075;
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+/**
+ * @brief Extract the device name from a raw advertisement payload
+ *        (AD type 0x09 = complete, 0x08 = shortened local name).
+ */
+static bool ble_name_from_payload(const uint8_t* payload, size_t payload_len,
+                                  char* out, size_t out_len) {
+    if (!payload || payload_len < 2 || !out || out_len == 0) return false;
+
+    size_t idx = 0;
+    while (idx + 1 < payload_len) {
+        uint8_t ad_len = payload[idx];
+        if (ad_len == 0) break;
+        if (idx + 1 + ad_len > payload_len) break;
+
+        uint8_t ad_type = payload[idx + 1];
+        if ((ad_type == 0x09 || ad_type == 0x08) && ad_len >= 2) {
+            size_t name_len = (size_t)ad_len - 1;
+            if (name_len > out_len - 1) name_len = out_len - 1;
+            memcpy(out, payload + idx + 2, name_len);
+            out[name_len] = 0;
+            return name_len > 0;
+        }
+
+        idx += (size_t)ad_len + 1;
+    }
+
+    return false;
+}
+
+/**
+ * @brief Decode sensor readings straight from the raw advertisement payload.
+ *
+ * Walks the AD structures and handles both service data (0x16, UUID 0xec88)
+ * and manufacturer specific data (0xFF) — the H5075 and most other Govee
+ * models send their readings in the latter, and the library's
+ * haveManufacturerData()/getManufacturerData() accessors were observed to
+ * report data belonging to a different advertisement (see onResult()).
+ */
+static bool ble_decode_raw_adv_payload(const uint8_t* payload, size_t payload_len,
+                                       const char* device_name,
+                                       float* adv_temp, float* adv_hum,
+                                       uint8_t* adv_battery, BLESensorType* sensor_type,
+                                       bool* saw_ec88_service, bool* saw_govee_mfg) {
     if (!payload || payload_len < 4) return false;
 
     size_t idx = 0;
@@ -894,40 +986,29 @@ static bool ble_decode_raw_service_data_ec88(BLEAdvertisedDevice& advertisedDevi
         if (idx + 1 + ad_len > payload_len) break;
 
         uint8_t ad_type = payload[idx + 1];
+        const uint8_t* ad_data = payload + idx + 2;
+
         if (ad_type == 0x16 && ad_len >= 3) {
-            const uint8_t* ad_data = payload + idx + 2;
+            // Service data: [uuid16][block]
             uint16_t uuid16 = (uint16_t)ad_data[0] | ((uint16_t)ad_data[1] << 8);
             if (uuid16 == 0xec88) {
                 if (saw_ec88_service) *saw_ec88_service = true;
-
-                const uint8_t* svc_payload = ad_data + 2;
-                size_t svc_len = (size_t)ad_len - 3;
-
-
-
-                // Direct decode first
-                if (govee_decode_adv_data(0xec88, svc_payload, svc_len, device_name,
-                                          adv_temp, adv_hum, adv_battery, sensor_type)) {
+                if (ble_decode_govee_block(0xec88, ad_data + 2, (size_t)ad_len - 3,
+                                           device_name, adv_temp, adv_hum,
+                                           adv_battery, sensor_type)) {
                     return true;
                 }
-
-                // H5075 fallback window decode if service payload has leading bytes
-                BLESensorType name_type = govee_detect_type_from_name(device_name);
-                if (name_type == BLE_TYPE_GOVEE_H5075 && svc_len >= 6) {
-                    for (size_t off = 0; off + 6 <= svc_len && off < 10; off++) {
-                        float t = 0, h = 0;
-                        uint8_t b = 0;
-                        if (govee_decode_h5075(svc_payload + off, 6, &t, &h, &b)) {
-                            if (t > -40.0f && t < 85.0f && h >= 0.0f && h <= 100.0f) {
-                                *adv_temp = t;
-                                *adv_hum = h;
-                                *adv_battery = b;
-                                if (sensor_type) *sensor_type = BLE_TYPE_GOVEE_H5075;
-                                return true;
-                            }
-                        }
-                    }
-                }
+            }
+        } else if (ad_type == 0xFF && ad_len >= 3) {
+            // Manufacturer specific data: [company_id][block]
+            uint16_t mfg_id = (uint16_t)ad_data[0] | ((uint16_t)ad_data[1] << 8);
+            if (mfg_id == 0xec88 || mfg_id == 0x0001) {
+                if (saw_govee_mfg) *saw_govee_mfg = true;
+            }
+            if (ble_decode_govee_block(mfg_id, ad_data + 2, (size_t)ad_len - 3,
+                                       device_name, adv_temp, adv_hum,
+                                       adv_battery, sensor_type)) {
+                return true;
             }
         }
 
@@ -1382,9 +1463,31 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
             return;
         }
 
-        // Get device name
+        // Work on a private copy of the raw advertisement. The library object
+        // handed to this callback has been observed to return name/payload data
+        // belonging to a *different* advertisement (the same Govee name showed
+        // up under three different MAC addresses), so everything that decides
+        // device identity is taken from this buffer first.
+        uint8_t adv_payload[BLE_ADV_PAYLOAD_MAX];
+        size_t adv_payload_len = 0;
+        {
+            const uint8_t* raw = advertisedDevice.getPayload();
+            size_t raw_len = advertisedDevice.getPayloadLength();
+            if (raw && raw_len) {
+                if (raw_len > sizeof(adv_payload)) raw_len = sizeof(adv_payload);
+                memcpy(adv_payload, raw, raw_len);
+                adv_payload_len = raw_len;
+            }
+        }
+
+        // Get device name: prefer the name carried by this advertisement, fall
+        // back to the library accessor (passive scans often see the name only
+        // in a separate scan response).
         char device_name[32] = "Unknown";
-        if (advertisedDevice.haveName()) {
+        char raw_name[32] = {0};
+        if (ble_name_from_payload(adv_payload, adv_payload_len, raw_name, sizeof(raw_name))) {
+            ble_sanitize_json_string(device_name, sizeof(device_name), raw_name);
+        } else if (advertisedDevice.haveName()) {
             ble_sanitize_json_string(device_name, sizeof(device_name), advertisedDevice.getName().c_str());
         }
 
@@ -1396,8 +1499,15 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
         bool saw_govee_mfg = false;
         bool saw_ec88_service = false;
 
+        // Decode from the raw payload first — it is guaranteed to belong to this
+        // advertisement and covers both manufacturer data (0xFF) and service
+        // data (0x16).
+        has_adv_data = ble_decode_raw_adv_payload(adv_payload, adv_payload_len, device_name,
+                                                  &adv_temp, &adv_hum, &adv_battery,
+                                                  &sensor_type, &saw_ec88_service, &saw_govee_mfg);
+
         // Check for manufacturer data (where Govee sends sensor readings)
-        if (advertisedDevice.haveManufacturerData()) {
+        if (!has_adv_data && advertisedDevice.haveManufacturerData()) {
             String mfg_data = advertisedDevice.getManufacturerData();
             if (mfg_data.length() >= 2) {
                 // First 2 bytes are manufacturer ID (little-endian)
@@ -1440,41 +1550,10 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
                 const uint8_t* svc_payload = (const uint8_t*)svc_data.c_str();
 
                 if (svc_uuid16 == 0xec88) {
-                    // 1) Try direct decode first
-                    has_adv_data = govee_decode_adv_data(0xec88, svc_payload, svc_len, device_name,
-                                                         &adv_temp, &adv_hum, &adv_battery, &sensor_type);
-
-                    // 2) Fallback for H5075-like payloads where service data contains
-                    // extra leading bytes before the 6-byte Govee value block.
-                    if (!has_adv_data) {
-                        BLESensorType name_type = govee_detect_type_from_name(device_name);
-                        if (name_type == BLE_TYPE_GOVEE_H5075 && svc_len >= 6) {
-                            for (size_t off = 0; off + 6 <= svc_len && off < 10 && !has_adv_data; off++) {
-                                float t = 0, h = 0;
-                                uint8_t b = 0;
-                                if (govee_decode_h5075(svc_payload + off, 6, &t, &h, &b)) {
-                                    // Plausibility bounds
-                                    if (t > -40.0f && t < 85.0f && h >= 0.0f && h <= 100.0f) {
-                                        adv_temp = t;
-                                        adv_hum = h;
-                                        adv_battery = b;
-                                        sensor_type = BLE_TYPE_GOVEE_H5075;
-                                        has_adv_data = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    has_adv_data = ble_decode_govee_block(0xec88, svc_payload, svc_len, device_name,
+                                                          &adv_temp, &adv_hum, &adv_battery, &sensor_type);
                 }
             }
-        }
-
-        // Raw AD payload fallback: some stack versions don't always populate
-        // service-data vectors for 0x16, but ec88 bytes are still present in payload.
-        if (!has_adv_data) {
-            has_adv_data = ble_decode_raw_service_data_ec88(advertisedDevice, device_name,
-                                                            &adv_temp, &adv_hum, &adv_battery,
-                                                            &sensor_type, &saw_ec88_service);
         }
 
         // Also try to detect type from name if not yet detected

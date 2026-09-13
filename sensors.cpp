@@ -23,6 +23,7 @@
 #include "sensors.h"
 #include "SensorBase.hpp"
 #include "sensors_util.h"
+#include "sensor_compat.h"
 #include "main.h"
 #include "TimeLib.h"
 #include <new>
@@ -449,6 +450,9 @@ boolean sensor_type_supported(int type) {
   if (type == SENSOR_INTERNAL_TEMP)
       return true;
 #endif
+  // Onboard digital inputs SN1/SN2 exist on every controller
+  if (type == SENSOR_ONBOARD_DIGITAL)
+      return true;
 
   // ZigBee sensors require Ethernet (WiFi shares the 2.4GHz radio)
 #if defined(ESP32C5) && defined(OS_ENABLE_ZIGBEE)
@@ -2003,6 +2007,7 @@ void read_all_sensors(boolean online) {
                      current_sensor->nr, result, read_ms);
         if (result == HTTP_RQT_SUCCESS) {
           current_sensor->last_read = time;
+          sensor_apply_post(current_sensor);
 #if !defined(ESP8266)
           current_sensor->trend_add_sample(current_sensor->last_data, time);
 #endif
@@ -2109,7 +2114,13 @@ SensorBase* sensor_make_obj(uint type, boolean ip_based) {
     case SENSOR_GROUP_MAX:
     case SENSOR_GROUP_AVG:
     case SENSOR_GROUP_SUM:
+    case SENSOR_GROUP_MEDIAN:
+    case SENSOR_GROUP_RANGE:
       return new GroupSensor(type);
+
+    // Onboard digital inputs (SN1/SN2 active state)
+    case SENSOR_ONBOARD_DIGITAL:
+      return new InternalSensor(type);
 
     #if defined(ESP8266) || defined(ESP32) || defined(OSPI)
     case SENSOR_FYTA_MOISTURE:
@@ -2138,6 +2149,7 @@ SensorBase* sensor_make_obj(uint type, boolean ip_based) {
     case SENSOR_THERM200:
     case SENSOR_AQUAPLUMB:
     case SENSOR_USERDEF:
+    case SENSOR_ANALOG_PIECEWISE:
       return new AsbSensor(type);
 #endif
 
@@ -2262,6 +2274,25 @@ SensorBase* sensor_make_obj(uint type, boolean ip_based) {
   return new GenericSensor(type);
 }
 
+/**
+ * @brief Output post-processing shared by all sensor types:
+ *        optional linear trim (value = lin_scale * value + lin_offset) and
+ *        optional clamping to [clamp_min, clamp_max]. Both are configured
+ *        through the upstream-compatible /csn API (scale/offset, min/max).
+ */
+void sensor_apply_post(SensorBase *sensor) {
+  if (!sensor || !sensor->flags.data_ok) return;
+  if (sensor->lin_set) {
+    sensor->last_data = (double)sensor->lin_scale * sensor->last_data + (double)sensor->lin_offset;
+  }
+  sensor->flags.clamped_lo = 0;
+  sensor->flags.clamped_hi = 0;
+  if (sensor->clamp_en && sensor->clamp_max > sensor->clamp_min) {
+    if (sensor->last_data < sensor->clamp_min) { sensor->last_data = sensor->clamp_min; sensor->flags.clamped_lo = 1; }
+    if (sensor->last_data > sensor->clamp_max) { sensor->last_data = sensor->clamp_max; sensor->flags.clamped_hi = 1; }
+  }
+}
+
 int read_sensor(SensorBase *sensor, ulong time) {
   if (!sensor) {
     DEBUG_PRINTLN(F("[SENSOR] read_sensor: sensor is NULL!"));
@@ -2300,55 +2331,14 @@ void sensor_update_groups() {
 
   for (auto &kv : sensorsMap) {
     SensorBase *sensor = kv.second;
+    if (!sensor_isgroup(sensor)) continue;
     if (time >= sensor->last_read + sensor->read_interval) {
-      switch (sensor->type) {
-        case SENSOR_GROUP_MIN:
-        case SENSOR_GROUP_MAX:
-        case SENSOR_GROUP_AVG:
-        case SENSOR_GROUP_SUM: {
-          uint nr = sensor->nr;
-          // If the group sensor itself has a group number assigned, aggregate
-          // all sensors sharing that group number (allows multiple group
-          // sensors to reference the same members). Otherwise fall back to the
-          // legacy behavior where members point to this group sensor's nr.
-          boolean shared = (sensor->group != 0);
-          uint target = shared ? sensor->group : nr;
-          double value = 0;
-          int n = 0;
-          for (auto &kv2 : sensorsMap) {
-            SensorBase *member = kv2.second;
-            // In shared mode, skip other group sensors so groups don't
-            // aggregate each other when they share the same group number.
-            if (shared && sensor_isgroup(member)) continue;
-            if (member->nr != nr && member->group == target && member->flags.enable) {
-              switch (sensor->type) {
-                case SENSOR_GROUP_MIN:
-                  if (n++ == 0) value = member->last_data;
-                  else if (member->last_data < value) value = member->last_data;
-                  break;
-                case SENSOR_GROUP_MAX:
-                  if (n++ == 0) value = member->last_data;
-                  else if (member->last_data > value) value = member->last_data;
-                  break;
-                case SENSOR_GROUP_AVG:
-                case SENSOR_GROUP_SUM:
-                  n++;
-                  value += member->last_data;
-                  break;
-              }
-            }
-          }
-          if (sensor->type == SENSOR_GROUP_AVG && n > 0) {
-            value = value / (double)n;
-          }
-          sensor->last_data = value;
-          sensor->last_native_data = 0;
-          sensor->last_read = time;
-          sensor->flags.data_ok = n > 0;
-          sensorlog_add(LOG_STD, sensor, time);
-          break;
-        }
-      }
+      // GroupSensor::read() implements MIN/MAX/AVG/SUM/MEDIAN/RANGE over
+      // the members (member->group == this group's target).
+      sensor->read(time);
+      sensor->last_read = time;
+      sensor_apply_post(sensor);
+      sensorlog_add(LOG_STD, sensor, time);
     }
   }
 }
@@ -2498,6 +2488,9 @@ double calc_sensor_watering_int(ProgSensorAdjust *p, double sensorData) {
     case PROG_DIGITAL_MINMAX:
       res = calc_digital_minmax(p, sensorData);
       break;
+    case PROG_PIECEWISE:
+      res = compat_prog_adjust_piecewise(p, sensorData);
+      break;
     default:
       res = 0;
   }
@@ -2519,6 +2512,14 @@ void ProgSensorAdjust::toJson(ArduinoJson::JsonObject obj) const {
   obj[F("stale_fallback")] = stale_fallback;
   obj[F("order")] = order;
   obj[F("name")] = getName();
+  if (pw_n && pw_points) {
+    ArduinoJson::JsonArray arr = obj[F("points")].to<ArduinoJson::JsonArray>();
+    for (uint8_t i = 0; i < pw_n; i++) {
+      ArduinoJson::JsonArray pt = arr.add<ArduinoJson::JsonArray>();
+      pt.add(pw_points[i].x);
+      pt.add(pw_points[i].y);
+    }
+  }
 }
 
 void ProgSensorAdjust::fromJson(ArduinoJson::JsonVariantConst obj) {
@@ -2537,6 +2538,24 @@ void ProgSensorAdjust::fromJson(ArduinoJson::JsonVariantConst obj) {
   order = obj[F("order")] | order;
   
   setName(obj[F("name")] | "");
+
+  // Piecewise points (absent key clears them: an edit through the classic
+  // /sb API redefines the adjustment by min/max/factor1/factor2 only).
+  SensorPoint_t pts[SENSOR_MAX_POINTS];
+  uint8_t n = 0;
+  if (obj.containsKey(F("points"))) {
+    ArduinoJson::JsonArrayConst arr = obj[F("points")].as<ArduinoJson::JsonArrayConst>();
+    for (ArduinoJson::JsonVariantConst v : arr) {
+      if (n >= SENSOR_MAX_POINTS) break;
+      ArduinoJson::JsonArrayConst pt = v.as<ArduinoJson::JsonArrayConst>();
+      if (pt.size() < 2) continue;
+      pts[n].x = pt[0].as<float>();
+      pts[n].y = pt[1].as<float>();
+      n++;
+    }
+  }
+  setPoints(pts, n);
+  if (type == PROG_PIECEWISE && pw_n < 2) type = PROG_NONE;
 }
 
 /**
@@ -2948,6 +2967,8 @@ boolean sensor_isgroup(const SensorBase *sensor) {
     case SENSOR_GROUP_MAX:
     case SENSOR_GROUP_AVG:
     case SENSOR_GROUP_SUM:
+    case SENSOR_GROUP_MEDIAN:
+    case SENSOR_GROUP_RANGE:
       return true;
 
     default:
@@ -2976,6 +2997,7 @@ unsigned char getSensorUnitId(int type) {
     case SENSOR_THERM200:          return UNIT_DEGREE;
     case SENSOR_AQUAPLUMB:         return UNIT_PERCENT;
     case SENSOR_USERDEF:           return UNIT_USERDEF;
+    case SENSOR_ANALOG_PIECEWISE:  return UNIT_USERDEF;
     // OSPi ADC
     case SENSOR_OSPI_ANALOG:       return UNIT_VOLT;
     case SENSOR_OSPI_ANALOG_P:     return UNIT_PERCENT;
@@ -2983,6 +3005,7 @@ unsigned char getSensorUnitId(int type) {
     case SENSOR_OSPI_ANALOG_SMT50_TEMP: return UNIT_DEGREE;
     // Internal / system
     case SENSOR_INTERNAL_TEMP:     return UNIT_DEGREE;
+    case SENSOR_ONBOARD_DIGITAL:   return UNIT_NONE;
     case SENSOR_FREE_MEMORY:       return UNIT_USERDEF;
     case SENSOR_FREE_STORE:        return UNIT_USERDEF;
     // FYTA

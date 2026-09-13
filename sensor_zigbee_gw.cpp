@@ -835,6 +835,15 @@ static unsigned long gw_last_bind_req_ms = 0;
 #ifndef GW_ED_TIMEOUT
 #define GW_ED_TIMEOUT ESP_ZB_ED_AGING_TIMEOUT_64MIN
 #endif
+// 802.15.4 transmit power of the coordinator in dBm.  The C5 PHY allows up to
+// 20 dBm (CONFIG_ESP_PHY_MAX_TX_POWER); ETSI EN 300 328 permits 20 dBm EIRP
+// at 2.4 GHz, so with a ~0-2 dBi PCB antenna 20 dBm conducted is the limit.
+// Only the coordinator -> device direction improves; the device's own TX
+// power (what we see as RSSI in the neighbor table) is unaffected.
+// 0 = leave the stack default.
+#ifndef GW_ZB_TX_POWER_DBM
+#define GW_ZB_TX_POWER_DBM 20
+#endif
 extern "C" esp_err_t esp_zb_nwk_set_keepalive_mode(int mode);
 extern "C" esp_err_t esp_zb_nwk_set_ed_timeout(esp_zb_aging_timeout_t timeout);
 
@@ -4280,6 +4289,16 @@ void sensor_zigbee_gw_start() {
     // Third Reality soil sensors do not poll after a report), so Bind /
     // ConfigureReporting / Read requests were dropped before the device ever
     // asked for them.  Keep them for GW_MAC_PERSISTENCE_S instead.
+    {
+        int8_t tx_before = 0, tx_after = 0;
+        esp_zb_lock_acquire(portMAX_DELAY);
+        esp_zb_get_tx_power(&tx_before);
+        if (GW_ZB_TX_POWER_DBM != 0) esp_zb_set_tx_power((int8_t)GW_ZB_TX_POWER_DBM);
+        esp_zb_get_tx_power(&tx_after);
+        esp_zb_lock_release();
+        DEBUG_PRINTF(F("[ZIGBEE-GW] TX power: default %d dBm -> now %d dBm (requested %d)\n"),
+                     (int)tx_before, (int)tx_after, (int)GW_ZB_TX_POWER_DBM);
+    }
     {
         esp_zb_lock_acquire(portMAX_DELAY);
         esp_err_t kerr = esp_zb_nwk_set_keepalive_mode(GW_KEEPALIVE_MODE);

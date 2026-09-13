@@ -166,6 +166,11 @@ int AsbSensor::read(unsigned long time) {
         this->last_data = 100;
       break;
     case SENSOR_USERDEF:  // User defined sensor
+      if (this->lin_set) {
+        // upstream-compatible linear trim: applied centrally by sensor_apply_post()
+        this->last_data = v;
+        break;
+      }
       v -= (double)this->offset_mv /
            1000;  // adjust zero-point offset in millivolt
       if (this->factor && this->divider)
@@ -176,6 +181,22 @@ int AsbSensor::read(unsigned long time) {
         v *= this->factor;
       this->last_data = v + this->offset2 / 100;
       break;
+    case SENSOR_ANALOG_PIECEWISE: {  // piecewise linear voltage -> value curve
+      if (this->pw_n < 2 || !this->pw_points) return HTTP_RQT_NOT_RECEIVED;
+      float x = (float)v;
+      float y;
+      if (x < this->pw_points[0].x) y = this->pw_points[0].y;
+      else if (x >= this->pw_points[this->pw_n - 1].x) y = this->pw_points[this->pw_n - 1].y;
+      else {
+        uint8_t i = 0;
+        while (i + 1 < this->pw_n - 1 && x >= this->pw_points[i + 1].x) i++;
+        const SensorPoint_t &l = this->pw_points[i];
+        const SensorPoint_t &r = this->pw_points[i + 1];
+        y = (r.x == l.x) ? r.y : (x - l.x) / (r.x - l.x) * (r.y - l.y) + l.y;
+      }
+      this->last_data = y;
+      break;
+    }
   }
 
   this->flags.data_ok = true;

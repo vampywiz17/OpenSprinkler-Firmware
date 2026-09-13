@@ -55,6 +55,10 @@ For security reasons, all examples in this documentation use the placeholder `<p
 
 ## Recent Updates
 
+### September 2026
+
+- **Upstream "Expanded Sensor" API compatibility (2.4.0(229))**: the official OpenSprinkler 2.2.1(5) endpoints `/jsn`, `/csn`, `/dsn`, `/jsd`, `/jsl`, `/dsl`, `/jpa`, the program `snadj` parameter (`/cp`, 8th element in `/jp`) and `/mp?usa=` are implemented as a facade over this sensor system (`sensor_compat.h/.cpp`). Upstream `uuid` == sensor `nr`. New sensor types: `SENSOR_ANALOG_PIECEWISE` (12), `SENSOR_ONBOARD_DIGITAL` (56), `SENSOR_GROUP_MEDIAN` (1004), `SENSOR_GROUP_RANGE` (1005); new adjustment type `PROG_PIECEWISE` (5, `points`); optional output post-processing fields `lscale`/`loffset`/`lset` and `cmin`/`cmax`/`clamp` in `sensors.json`. Mapping details: `docs/docs/pro-api-endpoints.md`.
+
 ### February 2026
 
 **Unified IEEE 802.15.4 Support (ESP32-C5):**

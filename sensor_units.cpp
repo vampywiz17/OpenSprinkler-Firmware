@@ -52,6 +52,7 @@ unsigned char AsbSensor::getUnitId() const {
     case SENSOR_VH400: return UNIT_PERCENT;
     case SENSOR_THERM200: return UNIT_DEGREE;
     case SENSOR_AQUAPLUMB: return UNIT_PERCENT;
+    case SENSOR_ANALOG_PIECEWISE:
     case SENSOR_USERDEF:
     case SENSOR_FREE_MEMORY:
     case SENSOR_FREE_STORE: return UNIT_USERDEF;

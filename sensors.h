@@ -121,6 +121,7 @@ extern "C" {
 #define SENSOR_SMT50_TEMP               16  // New OpenSprinkler analog extension board x8 - SMT50 T [°C] = (U – 0,5) * 100
 #define SENSOR_SMT100_ANALOG_MOIS       17  // New OpenSprinkler analog extension board x8 - SMT100 VWC [%] = (U * 100) : 3
 #define SENSOR_SMT100_ANALOG_TEMP       18  // New OpenSprinkler analog extension board x8 - SMT50 T [°C] = (U * 100) : 3 - 40
+#define SENSOR_ANALOG_PIECEWISE         12  // New OpenSprinkler analog extension board x8 - piecewise linear voltage->value curve (upstream ADS1115 subtype 1)
 
 #define SENSOR_VH400                    30  // New OpenSprinkler analog extension board x8 - Vegetronix VH400
 #define SENSOR_THERM200                 31  // New OpenSprinkler analog extension board x8 - Vegetronix THERM200
@@ -135,6 +136,7 @@ extern "C" {
 #define SENSOR_OSPI_ANALOG_SMT50_MOIS   52  // Old OSPi analog input - SMT50 VWC [%] = (U * 50) : 3
 #define SENSOR_OSPI_ANALOG_SMT50_TEMP   53  // Old OSPi analog input - SMT50 T [°C] = (U – 0,5) * 100
 #define SENSOR_INTERNAL_TEMP            54  // Internal temperature (OSPI/ESP32)
+#define SENSOR_ONBOARD_DIGITAL          56  // Onboard digital input SN1/SN2 (debounced active state, 0/1); id = input index
 
 #define INDEPENDENT_SENSORS_START       60  // starting id for independent sensors
 #define SENSOR_FYTA_MOISTURE            60  // FYTA moisture sensor
@@ -165,6 +167,8 @@ extern "C" {
 #define SENSOR_GROUP_MAX                1001 // Sensor group with max value
 #define SENSOR_GROUP_AVG                1002 // Sensor group with avg value
 #define SENSOR_GROUP_SUM                1003 // Sensor group with sum value
+#define SENSOR_GROUP_MEDIAN             1004 // Sensor group with median value
+#define SENSOR_GROUP_RANGE              1005 // Sensor group with range (max-min) value
 
 //Diagnostic
 #define SENSOR_FREE_MEMORY              10000 //Free memory
@@ -200,7 +204,17 @@ typedef struct SensorFlags {
   uint log : 1;      // log data enabled
   uint data_ok : 1;  // last data is ok
   uint show : 1;     // show on mainpage
+  uint clamped_lo : 1;  // runtime: last value was raised to clamp_min
+  uint clamped_hi : 1;  // runtime: last value was lowered to clamp_max
 } SensorFlags_t;
+
+// (x, y) sample point of a piecewise linear curve (sensor transform or
+// program adjustment). Shared with the upstream-compatible API (sensor_compat.h).
+typedef struct SensorPoint {
+  float x;
+  float y;
+} SensorPoint_t;
+#define SENSOR_MAX_POINTS 8
 
 #define RS485FLAGS_DATATYPE_UINT16 0 // 2 bytes
 #define RS485FLAGS_DATATYPE_INT16  1 // 2 bytes
@@ -246,6 +260,7 @@ typedef struct SensorLog {
 #define PROG_DIGITAL_MIN 2     // under or equal min : factor1 else factor2
 #define PROG_DIGITAL_MAX 3     // over or equal max  : factor2 else factor1
 #define PROG_DIGITAL_MINMAX 4  // under min or over max : factor1 else factor2
+#define PROG_PIECEWISE 5       // piecewise linear curve over pw_points (upstream "snadj" splits)
 #define PROG_NONE 99           // No adjustment
 
 #define PROG_STALE_LAST_VALUE 0  // keep current behaviour: use the last valid sensor value
@@ -270,6 +285,8 @@ public:
   uint8_t stale_policy;   // PROG_STALE_*
   double stale_fallback;  // adjustment factor, 1.0 = 100%
   uint order;             // display order (0=unset -> sort by nr)
+  uint8_t pw_n = 0;             // number of piecewise points (PROG_PIECEWISE, or exact copy of an upstream "snadj")
+  SensorPoint_t *pw_points = nullptr;  // heap allocated, only when pw_n > 0
   
   /**
    * @brief Constructor
@@ -281,7 +298,20 @@ public:
     setName("");
   }
 
-  ~ProgSensorAdjust() { free(_name); }
+  ~ProgSensorAdjust() { free(_name); free(pw_points); }
+
+  // Replace the piecewise points (n == 0 frees them)
+  void setPoints(const SensorPoint_t *pts, uint8_t n) {
+    free(pw_points);
+    pw_points = nullptr;
+    pw_n = 0;
+    if (!pts || n == 0) return;
+    if (n > SENSOR_MAX_POINTS) n = SENSOR_MAX_POINTS;
+    pw_points = (SensorPoint_t*)malloc(sizeof(SensorPoint_t) * n);
+    if (!pw_points) return;
+    memcpy(pw_points, pts, sizeof(SensorPoint_t) * n);
+    pw_n = n;
+  }
 
   // name accessors (getName() never returns nullptr) — dynamic to save RAM
   const char* getName() const { return _name ? _name : ""; }
@@ -554,6 +584,9 @@ Monitor* monitor_iterate_next(MonitorIterator& it);
 
 int read_sensor(SensorBase *sensor,
                 ulong time);  // sensor value goes to last_native_data/last_data
+// Post-processing after a successful read: optional linear trim
+// (lin_scale/lin_offset) and output clamping (clamp_min/clamp_max).
+void sensor_apply_post(SensorBase *sensor);
 
 // Sensorlog API functions:
 #define LOG_STD   0

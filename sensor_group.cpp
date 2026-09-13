@@ -23,6 +23,8 @@
 
 #include "sensor_group.h"
 
+#define SENSOR_GROUP_MEDIAN_MAX 16
+
 int GroupSensor::read(unsigned long time) {
   (void)time;
   double value = 0;
@@ -34,6 +36,8 @@ int GroupSensor::read(unsigned long time) {
   // where members reference this group sensor's nr.
   bool shared = (group != 0);
   uint target = shared ? group : nr;
+  double vmin = 0, vmax = 0;
+  double sorted[SENSOR_GROUP_MEDIAN_MAX];   // for MEDIAN: insertion-sorted member values
 
   for (auto it = sensors_iterate_begin(); ; ) {
     SensorBase *member = sensors_iterate_next(it);
@@ -58,10 +62,29 @@ int GroupSensor::read(unsigned long time) {
         n++;
         value += member->last_data;
         break;
+      case SENSOR_GROUP_RANGE:
+        if (n++ == 0) { vmin = vmax = member->last_data; }
+        else {
+          if (member->last_data < vmin) vmin = member->last_data;
+          if (member->last_data > vmax) vmax = member->last_data;
+        }
+        value = vmax - vmin;
+        break;
+      case SENSOR_GROUP_MEDIAN: {
+        if (n >= SENSOR_GROUP_MEDIAN_MAX) break;
+        double key = member->last_data;
+        int j = n - 1;
+        while (j >= 0 && sorted[j] > key) { sorted[j + 1] = sorted[j]; j--; }
+        sorted[j + 1] = key;
+        n++;
+        break;
+      }
     }
   }
   if (type == SENSOR_GROUP_AVG && n > 0)
     value = value / (double)n;
+  if (type == SENSOR_GROUP_MEDIAN && n > 0)
+    value = (n % 2) ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
 
   last_data = value;
   last_native_data = 0;

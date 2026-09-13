@@ -376,7 +376,8 @@ namespace {
     return type == SENSOR_MQTT || type == SENSOR_ZIGBEE ||
            type == SENSOR_BLE || type == SENSOR_REMOTE ||
            type == SENSOR_GROUP_MIN || type == SENSOR_GROUP_MAX ||
-           type == SENSOR_GROUP_AVG || type == SENSOR_GROUP_SUM;
+           type == SENSOR_GROUP_AVG || type == SENSOR_GROUP_SUM ||
+           type == SENSOR_GROUP_MEDIAN || type == SENSOR_GROUP_RANGE;
   }
 
   MatterSensorEndpoint matter_sensor_endpoint_for(const SensorBase* sensor) {

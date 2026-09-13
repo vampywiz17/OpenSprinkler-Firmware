@@ -49,6 +49,17 @@ public:
   int16_t offset_mv = 0;          // offset in millivolt
   int16_t offset2 = 0;            // offset unit (1/100)
   unsigned char assigned_unitid = 0;  // unitid for userdef and mqtt sensors
+  // Output post-processing (upstream-compatible "Expanded Sensor" semantics):
+  //   value = lin_scale * value + lin_offset   (when lin_set)
+  //   value clamped to [clamp_min, clamp_max]  (when clamp_en)
+  float lin_scale = 1.0f;         // linear trim factor
+  float lin_offset = 0.0f;        // linear trim offset (in output units)
+  uint8_t lin_set = 0;            // 1 = apply lin_scale/lin_offset
+  float clamp_min = 0.0f;         // output clamp range
+  float clamp_max = 0.0f;
+  uint8_t clamp_en = 0;           // 1 = clamp output to [clamp_min, clamp_max]
+  SensorPoint_t *pw_points = nullptr;  // piecewise linear curve (SENSOR_ANALOG_PIECEWISE), heap allocated
+  uint8_t pw_n = 0;               // number of points in pw_points
   
   /* runtime-only fields not persisted */
   unsigned char unitid = 0;
@@ -73,7 +84,20 @@ public:
 
   SensorBase() { setName(""); }
   explicit SensorBase(uint type) { this->type = type; setName(""); } // for derived classes compatibility
-  virtual ~SensorBase() { free(_name); free(_userdef_unit); }
+  virtual ~SensorBase() { free(_name); free(_userdef_unit); free(pw_points); }
+
+  // Replace the piecewise points (n == 0 frees them)
+  void setPoints(const SensorPoint_t *pts, uint8_t n) {
+    free(pw_points);
+    pw_points = nullptr;
+    pw_n = 0;
+    if (!pts || n == 0) return;
+    if (n > SENSOR_MAX_POINTS) n = SENSOR_MAX_POINTS;
+    pw_points = (SensorPoint_t*)malloc(sizeof(SensorPoint_t) * n);
+    if (!pw_points) return;
+    memcpy(pw_points, pts, sizeof(SensorPoint_t) * n);
+    pw_n = n;
+  }
 
   // --- name accessors (getName() never returns nullptr) ---
   const char* getName() const { return _name ? _name : ""; }
@@ -263,6 +287,24 @@ public:
     obj[F("log")] = (uint)flags.log;
     obj[F("stdlog")] = (uint)stdlog;
     obj[F("show")] = (uint)flags.show;
+    if (lin_set) {
+      obj[F("lset")] = 1;
+      obj[F("lscale")] = lin_scale;
+      obj[F("loffset")] = lin_offset;
+    }
+    if (clamp_en) {
+      obj[F("clamp")] = 1;
+      obj[F("cmin")] = clamp_min;
+      obj[F("cmax")] = clamp_max;
+    }
+    if (pw_n && pw_points) {
+      ArduinoJson::JsonArray arr = obj[F("points")].to<ArduinoJson::JsonArray>();
+      for (uint8_t i = 0; i < pw_n; i++) {
+        ArduinoJson::JsonArray pt = arr.add<ArduinoJson::JsonArray>();
+        pt.add(pw_points[i].x);
+        pt.add(pw_points[i].y);
+      }
+    }
 
     // runtime fields
     obj[F("data_ok")] = (uint)flags.data_ok;
@@ -306,6 +348,26 @@ public:
     if (obj.containsKey(F("log"))) flags.log = obj[F("log")];
     if (obj.containsKey(F("stdlog"))) stdlog = obj[F("stdlog")];
     if (obj.containsKey(F("show"))) flags.show = obj[F("show")];
+    if (obj.containsKey(F("lset"))) lin_set = obj[F("lset")].as<int>() ? 1 : 0;
+    if (obj.containsKey(F("lscale"))) lin_scale = obj[F("lscale")].as<float>();
+    if (obj.containsKey(F("loffset"))) lin_offset = obj[F("loffset")].as<float>();
+    if (obj.containsKey(F("clamp"))) clamp_en = obj[F("clamp")].as<int>() ? 1 : 0;
+    if (obj.containsKey(F("cmin"))) clamp_min = obj[F("cmin")].as<float>();
+    if (obj.containsKey(F("cmax"))) clamp_max = obj[F("cmax")].as<float>();
+    if (obj.containsKey(F("points"))) {
+      SensorPoint_t pts[SENSOR_MAX_POINTS];
+      uint8_t n = 0;
+      ArduinoJson::JsonArrayConst arr = obj[F("points")].as<ArduinoJson::JsonArrayConst>();
+      for (ArduinoJson::JsonVariantConst v : arr) {
+        if (n >= SENSOR_MAX_POINTS) break;
+        ArduinoJson::JsonArrayConst pt = v.as<ArduinoJson::JsonArrayConst>();
+        if (pt.size() < 2) continue;
+        pts[n].x = pt[0].as<float>();
+        pts[n].y = pt[1].as<float>();
+        n++;
+      }
+      setPoints(pts, n);
+    }
 
     if (obj.containsKey(F("data_ok"))) flags.data_ok = obj[F("data_ok")];
     if (obj.containsKey(F("last"))) last = obj[F("last")];

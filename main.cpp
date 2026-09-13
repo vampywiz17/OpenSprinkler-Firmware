@@ -162,7 +162,7 @@ static void debug_os_state_transition(const char* where, uint8_t from_state, uin
 static inline void debug_os_state_transition(const char*, uint8_t, uint8_t) {}
 #endif
 
-void manual_start_program(unsigned char, unsigned char, unsigned char);
+void manual_start_program(unsigned char, unsigned char, unsigned char, unsigned char usa);
 void stop_program(unsigned char);
 void remote_http_callback(char*);
 
@@ -3006,7 +3006,9 @@ void stop_program(unsigned char pid) {
  * If pid==255, this is a short test program (2 second per station)
  * If pid > 0. run program pid-1
  */
-void manual_start_program(unsigned char pid, unsigned char uwt, unsigned char qo) {
+// usa: 1 = apply the program's sensor adjustment, 0 = sensor factor 100 %,
+//      255 (default, legacy OpenSprinklerShop behaviour) = always apply it.
+void manual_start_program(unsigned char pid, unsigned char uwt, unsigned char qo, unsigned char usa) {
 	boolean match_found = false;
 	// Track which real program is being run manually so the UI can display correct program name/progress
 	pd.current_mpid = (pid > 0 && pid < 255) ? pid : 0;
@@ -3028,7 +3030,7 @@ void manual_start_program(unsigned char pid, unsigned char uwt, unsigned char qo
 		pd.read(pid-1, &prog);
 		if (uwt == 255) uwt = prog.use_weather;
 		if(uwt) wl = os.iopts[IOPT_WATER_PERCENTAGE];
-		prog_adjust = calc_sensor_watering(pid-1);
+		if (usa != 0) prog_adjust = calc_sensor_watering(pid-1);
 		notif.add(NOTIFY_PROGRAM_SCHED, pid-1, wl, 1);
 		// get station ordering from program name
 		prog.gen_station_runorder(1, order);
