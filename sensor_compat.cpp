@@ -220,7 +220,7 @@ static void compat_trim_of(const SensorBase *s, CompatAds1115Subtype st, double 
 CompatSensorType compat_type_of(const SensorBase *s) {
 	if (!s) return CompatSensorType::Native;
 	if (sensor_isgroup(s)) return CompatSensorType::Aggregate;
-	if (compat_is_ads_type(s->type)) return CompatSensorType::ADS1115;
+	if (compat_is_ads_type(s->type)) return CompatSensorType::Ads1115;
 	if (compat_weather_action_of(s->type) >= 0) return CompatSensorType::Weather;
 	switch (s->type) {
 		case SENSOR_FREE_MEMORY:
@@ -354,7 +354,7 @@ uint32_t compat_interval_of(const SensorBase *s) {
 static void compat_default_range(const SensorBase *s, double &min, double &max) {
 	min = 0; max = 100;
 	switch (compat_type_of(s)) {
-		case CompatSensorType::ADS1115: {
+		case CompatSensorType::Ads1115: {
 			double sc, of;
 			CompatAds1115Subtype st = compat_subtype_of(s, sc, of);
 			switch (st) {
@@ -488,7 +488,7 @@ static void compat_emit_extra_json(BufferFiller &bfill, SensorBase *s) {
 			bfill.emit_p(PSTR("]}"));
 			break;
 		}
-		case CompatSensorType::ADS1115: {
+		case CompatSensorType::Ads1115: {
 			double scale, offset;
 			CompatAds1115Subtype st = compat_subtype_of(s, scale, offset);
 			compat_trim_of(s, st, scale, offset);
@@ -679,7 +679,7 @@ void compat_emit_sensor_desc_json(BufferFiller &bfill, CompatFlushFn flush, void
 		if (i) bfill.emit_p(PSTR(","));
 		switch ((CompatSensorType)i) {
 			case CompatSensorType::Aggregate:      compat_emit_desc_aggregate(bfill); break;
-			case CompatSensorType::ADS1115:        compat_emit_desc_ads1115(bfill); break;
+			case CompatSensorType::Ads1115:        compat_emit_desc_ads1115(bfill); break;
 			case CompatSensorType::Weather:        compat_emit_desc_weather(bfill); break;
 			case CompatSensorType::SystemInternal: compat_emit_desc_system(bfill); break;
 			case CompatSensorType::OnboardDigital: compat_emit_desc_onboard(bfill); break;
@@ -987,7 +987,7 @@ CompatResult compat_change_sensor(CompatCsnParams &p, uint *out_nr) {
 			}
 			break;
 		}
-		case CompatSensorType::ADS1115: {
+		case CompatSensorType::Ads1115: {
 			CompatResult r = compat_resolve_ads_type(p, existing, ntype);
 			if (r != COMPAT_OK) return r;
 			if (p.has_pin) {
@@ -1095,7 +1095,7 @@ CompatResult compat_change_sensor(CompatCsnParams &p, uint *out_nr) {
 
 	// user-defined units (linear/piecewise analog, aggregate, native)
 	if (p.has_unit && native_unit == CompatUnit::None &&
-	    (p.type == CompatSensorType::ADS1115 || p.type == CompatSensorType::Aggregate ||
+	    (p.type == CompatSensorType::Ads1115 || p.type == CompatSensorType::Aggregate ||
 	     p.type == CompatSensorType::Native)) {
 		unsigned char uid = compat_native_unitid(p.unit);
 		cfg["unitid"] = uid;
@@ -1118,7 +1118,7 @@ CompatResult compat_change_sensor(CompatCsnParams &p, uint *out_nr) {
 	}
 
 	// type specific
-	if (p.type == CompatSensorType::ADS1115) {
+	if (p.type == CompatSensorType::Ads1115) {
 		if (p.has_pin) {
 #if defined(ESP8266) || defined(ESP32)
 			cfg["port"] = ASB_BOARD_ADDR1a + (p.pin - 1) / 4;

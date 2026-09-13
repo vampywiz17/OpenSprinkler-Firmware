@@ -50,7 +50,7 @@ class BufferFiller;
 // Zigbee, BLE, FYTA, ...) generically.
 enum class CompatSensorType : uint8_t {
 	Aggregate = 0,
-	ADS1115 = 1,
+	Ads1115 = 1,
 	Weather = 2,
 	SystemInternal = 3,
 	OnboardDigital = 4,
