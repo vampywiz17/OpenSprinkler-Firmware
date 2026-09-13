@@ -584,11 +584,7 @@ private:
     uint8_t additionalResponseLineOnConnection = 0;
     uint8_t additionalResponseLineOnHELO = 0;
 
-#ifdef SSLCLIENT_WRAPPER
-    Response awaitSMTPResponse(SSLClient &client, const char* resp = "", const char* respDesc = "", uint16_t timeOut = 10000);
-#else
     Response awaitSMTPResponse(EMAIL_NETWORK_CLASS &client, const char* resp = "", const char* respDesc = "", uint16_t timeOut = 10000);
-#endif
 };
 
 #endif

@@ -241,6 +241,11 @@ struct ZigbeeStationData {
 	char reserved[15];      // reserved/padding (matches 36 bytes)
 };
 
+// Runtime role of a logical device (from the device DB): which Tuya DP takes
+// the ON duration so the valve closes itself even if the OFF command is lost.
+enum : uint8_t { ZB_LD_ROLE_NONE = 0, ZB_LD_ROLE_RUNTIME = 1, ZB_LD_ROLE_MODE = 2 };
+enum : uint8_t { ZB_RT_UNIT_S = 0, ZB_RT_UNIT_MIN = 1, ZB_RT_UNIT_H = 2 };
+
 /** ZigBee Logical Device — represents a sensor/actuator function on a ZigBee device
  *  Multiple logical devices can exist for a single IEEE address (e.g., multi-channel valve)
  *  Indexed in RAM as: IEEE#LogicalDeviceName for O(1) lookup
@@ -259,6 +264,14 @@ struct ZigBeeLogicalDevice {
 	int16_t tuya_dp_unit;             // Tuya DP for unit selector
 	int16_t tuya_dp_status;           // Tuya DP for valve status (secondary)
 	int16_t tuya_dp_consumption;      // Tuya DP for water consumption
+
+	// Runtime role (device DB): see ZB_LD_ROLE_* / ZB_RT_UNIT_*
+	uint8_t role;                     // ZB_LD_ROLE_NONE / RUNTIME / MODE
+	uint8_t channel;                  // valve channel this row belongs to (0 = derive from name)
+	uint8_t runtime_unit;             // ZB_RT_UNIT_* (role == RUNTIME)
+	uint16_t runtime_max;             // device limit in runtime_unit (0 = default)
+	int16_t prereq_dp;                // DP written before the runtime DP (0 = none)
+	int16_t prereq_value;             // value for prereq_dp
 	
 	// Factor/divider for unit conversion
 	int16_t factor;

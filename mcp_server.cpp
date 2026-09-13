@@ -917,34 +917,10 @@ static int tool_configure_monitor(const ArduinoJson::JsonObjectConst& args) {
   uint16_t port = params["port"] | 0;
 
   Monitor_Union_t m;
-  switch (type) {
-    case MONITOR_MIN:
-    case MONITOR_MAX:
-      m = (Monitor_Union_t){.minmax = {.value1 = value1, .value2 = value2}};
-      break;
-    case MONITOR_SENSOR12:
-      m = (Monitor_Union_t){.sensor12 = {.sensor12 = sensor12, .invers = invers}};
-      break;
-    case MONITOR_SET_SENSOR12:
-      m = (Monitor_Union_t){.set_sensor12 = {.monitor = monitor, .sensor12 = sensor12}};
-      break;
-    case MONITOR_AND:
-    case MONITOR_OR:
-    case MONITOR_XOR:
-      m = (Monitor_Union_t){.andorxor = {.monitor1 = monitor1, .monitor2 = monitor2, .monitor3 = monitor3, .monitor4 = monitor4,
-        .invers1 = invers1, .invers2 = invers2, .invers3 = invers3, .invers4 = invers4}};
-      break;
-    case MONITOR_NOT:
-      m = (Monitor_Union_t){.mnot = {.monitor = monitor}};
-      break;
-    case MONITOR_TIME:
-      m = (Monitor_Union_t){.mtime = {.time_from = time_from, .time_to = time_to, .weekdays = wdays}};
-      break;
-    case MONITOR_REMOTE:
-      m = (Monitor_Union_t){.remote = {.rmonitor = rmonitor, .ip = ip, .port = port}};
-      break;
-    default:
-      return 18; // HTML_DATA_FORMATERROR
+  if (!monitor_union_build(m, type, value1, value2, sensor12, invers,
+                           monitor1, monitor2, monitor3, monitor4, invers1, invers2, invers3, invers4,
+                           monitor, time_from, time_to, wdays, rmonitor, ip, port)) {
+    return 18; // HTML_DATA_FORMATERROR
   }
 
   int ret = monitor_define(nr, type, sensor, prog, zone, m, name, maxRuntime, prio, reset_seconds, output_mode, stale_timeout, failsafe_active, order, show);

@@ -245,11 +245,23 @@ bool sensor_zigbee_gw_request_dp_query(uint64_t device_ieee, uint8_t endpoint);
 void sensor_zigbee_gw_force_off_all_stations();
 
 /**
- * @brief Register a pending switch-state verification for a Zigbee station.
- * Called from switch_zigbeestation after each ON/OFF command is sent.
- * ctrl_type: 0 = standard ZCL On/Off, 1 = Tuya DP, 2 = GIEX water valve.
+ * @brief Record the desired ON/OFF state of a Zigbee station and send it.
+ * The per-station state machine re-sends with backoff, re-sends immediately
+ * when the device wakes up, evaluates the APS confirm and treats the Tuya DP
+ * echo as final confirmation. The latest command always replaces a pending one.
+ * dp_id: DP written (Tuya/GIEX), verify_dp: DP that echoes the state,
+ * ctrl_type: 0 = standard ZCL On/Off, 1 = Tuya DP, 2 = GIEX water valve,
+ * dur: remaining runtime in seconds (0 = unknown).
  */
-void sensor_zigbee_station_verify_register(uint8_t sid, uint64_t ieee, uint8_t endpoint, uint8_t dp_id, bool expected_on, uint8_t ctrl_type = 1);
+void sensor_zigbee_station_command(uint8_t sid, uint64_t ieee, uint8_t endpoint, uint8_t dp_id, uint8_t verify_dp,
+                                   bool turnon, uint8_t ctrl_type, uint16_t dur,
+                                   const ZigbeeStationControlConfig* cfg = nullptr);
+
+/**
+ * @brief Re-queue bind + configure-reporting for every sensor on this device
+ * (used when a REPORT-mode sensor went silent or the device re-announced).
+ */
+void sensor_zigbee_gw_refresh_reporting(uint64_t ieee);
 
 /**
  * @brief Return the current Zigbee station switch status.
@@ -264,7 +276,7 @@ uint8_t sensor_zigbee_station_status_code(uint8_t sid);
 void sensor_zigbee_station_clear_error(uint8_t sid);
 
 /**
- * @brief Check for timed-out station switch verifications and publish alerts.
+ * @brief Drive the station switch state machine (retries, backoff, alerts).
  * Called from sensor_zigbee_gw_loop() on every pass.
  */
 void sensor_zigbee_station_verify_tick();

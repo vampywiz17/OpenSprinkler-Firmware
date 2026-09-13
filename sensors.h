@@ -615,6 +615,15 @@ void monitor_load();
 void monitor_save();
 int monitor_count();
 int monitor_delete(uint nr, bool save_now = true);
+/** Fill the type-specific part of a monitor definition from the flat
+ *  parameter set used by the HTTP (/mc) and MCP APIs. Returns false for an
+ *  unknown monitor type. */
+bool monitor_union_build(Monitor_Union_t &m, uint type, double value1, double value2,
+                         uint16_t sensor12, bool invers,
+                         uint16_t monitor1, uint16_t monitor2, uint16_t monitor3, uint16_t monitor4,
+                         bool invers1, bool invers2, bool invers3, bool invers4,
+                         uint16_t monitor, uint16_t time_from, uint16_t time_to, uint8_t weekdays,
+                         uint16_t rmonitor, uint32_t ip, uint16_t port);
 int monitor_define(uint nr, uint type, uint sensor, uint prog, uint zone, const Monitor_Union_t m, char * name, ulong maxRuntime, uint8_t prio, ulong reset_seconds = 0, uint8_t output_mode = 0, ulong stale_timeout = 0, uint8_t failsafe_active = 0, uint order = 0, uint8_t show = 1);
 Monitor_t * monitor_by_nr(uint nr);
 Monitor_t * monitor_by_idx(uint idx);

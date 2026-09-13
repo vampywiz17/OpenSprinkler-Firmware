@@ -160,19 +160,6 @@ uint8_t readSC16Register(uint8_t reg) {
   return result;
 }
 
-void UART_sendByte(uint8_t data) {
-  // Warten bis der THR (Transmit Holding Register) leer ist
-  uint32_t start = millis();
-  while (!(readSC16Register(REG_LSR) & 0x20)) { // LSR Bit 5 (THRE)
-    if (millis() - start > 50) {
-      DEBUG_PRINTLN(F("i2c_rs485: THR timeout"));
-      return;
-    }
-    delay(1);
-  }
-  writeSC16Register(REG_THR, data);
-}
-
 void UART_sendBytes(uint8_t data[], uint8_t len) {
   // Blast all bytes directly to the TX FIFO in a SINGLE I2C transaction!
   // If we use separate transactions, FreeRTOS might preempt the task between bytes,

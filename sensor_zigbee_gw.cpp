@@ -46,9 +46,14 @@ extern "C" {
 #include "esp_zigbee_core.h"
 #include "esp_zigbee_secur.h"
 #include "nwk/esp_zigbee_nwk.h"
+#include "mac/esp_zigbee_mac.h"
 #include "Zigbee.h"
 #include "ZigbeeEP.h"
+#include "sensor_zigbee_common.h"
 #include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/idf_additions.h>
 #include "espconnect.h"
 
 // Optional: Restrict Zigbee to a single channel (e.g. 25 = 2475 MHz) to
@@ -99,19 +104,6 @@ static constexpr const char* GW_DISCOVERED_DEVICES_BAD_FILE = "/zb_gw_devices_ba
 static bool gw_discovered_devices_loaded = false;
 static bool gw_discovered_devices_dirty = false;
 
-struct GwPendingSwitchCommand {
-    bool valid;
-    bool use_tuya;
-    uint64_t ieee_addr;
-    uint8_t endpoint;
-    uint8_t dp_id;
-    bool turnon;
-    uint8_t attempts;
-    unsigned long next_try_ms;
-};
-
-static GwPendingSwitchCommand gw_pending_switch = {false, false, 0, 1, 1, false, 0, 0};
-
 struct GwTuyaScheduledCommand {
     bool used;
     uint16_t short_addr;
@@ -121,10 +113,16 @@ struct GwTuyaScheduledCommand {
     uint8_t dp_type;
     uint16_t seq;
     uint8_t payload_len;
-    uint8_t payload[20];
+    uint8_t payload[32];
+    uint8_t sid;          // station this command belongs to (0xFF = none)
 };
 
 static constexpr size_t GW_TUYA_SCHEDULE_MAX = 8;
+// Station on whose behalf a command is currently being built (0xFF = none);
+// set by the switch state machine around its send calls so the ZCL tsn can be
+// tied back to the station entry.
+static uint8_t gw_ctl_sending_sid = 0xFF;
+static void gw_station_ctl_note_sent(uint8_t sid, uint8_t tsn);
 // Outgoing Tuya command queue lives in PSRAM to keep it off the internal heap.
 static GwTuyaScheduledCommand* gw_tuya_schedule = nullptr;
 static uint32_t gw_tuya_next_due_ms = 0;
@@ -143,9 +141,10 @@ static inline bool ensure_tuya_schedule() {
     return gw_tuya_schedule != nullptr;
 }
 
-// Minimum spacing between ANY two ZigBee command sends (global, across all
-// devices) to avoid flooding the ZBOSS stack / RF collisions.
-#define GW_TUYA_MIN_SEND_SPACING_MS 5000UL
+// Minimum spacing between ANY two queued Tuya command sends (global, across
+// all devices) to avoid flooding the ZBOSS stack / RF collisions. Urgent sends
+// (device just woke up) bypass this; see gw_schedule_tuya_dp_cmd().
+#define GW_TUYA_MIN_SEND_SPACING_MS 2000UL
 
 static uint64_t gw_find_ieee_by_short_addr(uint16_t short_addr);
 static void gw_tuya_schedule_next();
@@ -176,6 +175,7 @@ static void gw_reset_discovered_devices_runtime_fields(ZigbeeDeviceInfo& dev) {
     dev.logical_lookup_done = false;
     dev.battery = 255;
     dev.lqi = 0;
+    dev.rssi = 0;
 }
 
 static void gw_clear_discovered_devices_cache(bool remove_persisted_file) {
@@ -260,6 +260,7 @@ static bool gw_load_discovered_devices() {
         gw_reset_discovered_devices_runtime_fields(info);
         info.battery = obj["battery"] | 255U;
         info.lqi = obj["lqi"] | 0U;
+        info.rssi = (int8_t)(obj["rssi"] | 0);
         if (info.ieee_addr == 0) continue;
 
         ZigbeeDeviceInfo* existing = gw_find_discovered_device(info.ieee_addr);
@@ -302,6 +303,7 @@ static bool gw_save_discovered_devices() {
         if (dev.is_custom_name) obj["is_custom_name"] = true;
         if (dev.battery != 255) obj["battery"] = dev.battery;
         if (dev.lqi != 0) obj["lqi"] = dev.lqi;
+        if (dev.rssi != 0) obj["rssi"] = dev.rssi;
     }
 
     LittleFS.remove(GW_DISCOVERED_DEVICES_TMP_FILE);
@@ -370,6 +372,11 @@ static void gw_queue_device_query(uint64_t ieee_addr, uint8_t endpoint, bool nee
                  need_basic ? 1U : 0U, need_tuya ? 1U : 0U);
 }
 
+// True while a station ON/OFF command is outstanding for this device.  A sleepy
+// valve fetches ONE pending frame per poll, so discovery traffic (Basic /
+// Tuya DP queries) must not compete with the command for that slot.
+static bool gw_station_ctl_pending_for(uint64_t ieee);
+
 static void gw_process_device_query_queue() {
     if (!gw_zigbee_initialized || !Zigbee.started() || !Zigbee.connected()) return;
     if (gw_device_query_queue.empty()) return;
@@ -379,6 +386,10 @@ static void gw_process_device_query_queue() {
     for (auto it = gw_device_query_queue.begin(); it != gw_device_query_queue.end(); ++it) {
         if (!it->used) continue;
         if ((int32_t)(now - it->next_try_ms) < 0) continue;
+        if (gw_station_ctl_pending_for(it->ieee_addr)) {
+            it->next_try_ms = now + 30000UL;  // station command first
+            continue;
+        }
 
         bool sent = false;
         bool tried_any = false;
@@ -451,6 +462,7 @@ static void gw_tuya_scheduled_send(uint8_t slot) {
     uint8_t tsn = esp_zb_zcl_custom_cluster_cmd_req(&req);
     esp_zb_lock_release();
     cmd.used = false;
+    gw_station_ctl_note_sent(cmd.sid, tsn);
     DEBUG_PRINTF(F("[ZIGBEE-GW] Tuya DP cmd dispatched, slot=%u tsn=%u dp=%u seq=%u short=0x%04X\n"),
                  (unsigned)slot, (unsigned)tsn, (unsigned)cmd.dp_id, (unsigned)cmd.seq, cmd.short_addr);
 }
@@ -530,9 +542,9 @@ static bool gw_is_device_access_allowed(uint64_t ieee_addr, uint16_t short_addr,
         if ((ieee_addr != 0 && entry.ieee_addr == ieee_addr) || 
             (short_addr != 0 && short_addr != 0xFFFF && short_addr != 0xFFFE && entry.short_addr == short_addr)) {
             if (is_write) {
-                if (entry.last_read_ms != 0 && (now - entry.last_read_ms < cooldown_ms)) {
-                    return false;
-                }
+                // Only space writes against writes. A preceding read (DP query,
+                // Basic Cluster) must not delay a valve command: right after a
+                // sleepy device answered is the best moment to reach it.
                 if (entry.last_write_ms != 0 && (now - entry.last_write_ms < cooldown_ms)) {
                     return false;
                 }
@@ -581,12 +593,33 @@ static void gw_tuya_schedule_next() {
 
 static bool gw_schedule_tuya_dp_cmd(uint16_t short_addr, uint8_t endpoint, uint8_t command_id,
                                     uint8_t dp_id, uint8_t dp_type, const uint8_t* payload,
-                                    size_t payload_len, uint16_t seq) {
+                                    size_t payload_len, uint16_t seq, bool urgent) {
     if (!payload || payload_len == 0 || payload_len > sizeof(gw_tuya_schedule[0].payload)) return false;
     if (!ensure_tuya_schedule()) return false;
 
+    // One pending command per station / per (device, DP, command).  A station
+    // retry or a direction change (ON -> OFF) must REPLACE the not-yet-sent
+    // command instead of queueing behind it: with the per-device send spacing a
+    // sleepy valve otherwise receives the stale opposite command after the new
+    // one (seen as "on works, off toggles back, then nothing").
+    int8_t reuse = -1;
     for (uint8_t slot = 0; slot < GW_TUYA_SCHEDULE_MAX; slot++) {
-        if (gw_tuya_schedule[slot].used) continue;
+        const GwTuyaScheduledCommand& c = gw_tuya_schedule[slot];
+        if (!c.used) continue;
+        bool same_station = (gw_ctl_sending_sid != 0xFF && c.sid == gw_ctl_sending_sid);
+        bool same_cmd     = (gw_ctl_sending_sid == 0xFF && c.sid == 0xFF &&
+                             c.short_addr == short_addr && c.endpoint == endpoint &&
+                             c.command_id == command_id && c.dp_id == dp_id);
+        if (same_station || same_cmd) { reuse = (int8_t)slot; break; }
+    }
+    if (reuse >= 0) {
+        DEBUG_PRINTF(F("[ZIGBEE-GW] Tuya DP cmd replaces pending slot=%u (old seq=%u) dp=%u short=0x%04X\n"),
+                     (unsigned)reuse, (unsigned)gw_tuya_schedule[reuse].seq, (unsigned)dp_id, short_addr);
+    }
+
+    for (uint8_t slot = 0; slot < GW_TUYA_SCHEDULE_MAX; slot++) {
+        if (gw_tuya_schedule[slot].used && (int8_t)slot != reuse) continue;
+        gw_tuya_schedule[slot].sid = gw_ctl_sending_sid;
 
         gw_tuya_schedule[slot].used = true;
         gw_tuya_schedule[slot].short_addr = short_addr;
@@ -598,6 +631,16 @@ static bool gw_schedule_tuya_dp_cmd(uint16_t short_addr, uint8_t endpoint, uint8
         gw_tuya_schedule[slot].payload_len = (uint8_t)payload_len;
         memcpy(gw_tuya_schedule[slot].payload, payload, payload_len);
 
+        if (urgent) {
+            // The device is awake right now (it just sent us a frame): dispatch
+            // immediately, bypassing the per-device cooldown and global spacing.
+            gw_tuya_scheduled_send(slot);
+            gw_record_device_access(0, short_addr, true);
+            gw_tuya_next_due_ms = millis() + 500UL;
+            DEBUG_PRINTF(F("[ZIGBEE-GW] Tuya DP cmd sent urgently, dp=%u seq=%u short=0x%04X\n"),
+                         (unsigned)dp_id, (unsigned)seq, short_addr);
+            return true;
+        }
         if (gw_tuya_next_due_ms == 0) gw_tuya_next_due_ms = millis() + 50UL;
         DEBUG_PRINTF(F("[ZIGBEE-GW] Tuya DP cmd queued, slot=%u dp=%u seq=%u short=0x%04X\n"),
                  (unsigned)slot, (unsigned)dp_id, (unsigned)seq, short_addr);
@@ -606,24 +649,6 @@ static bool gw_schedule_tuya_dp_cmd(uint16_t short_addr, uint8_t endpoint, uint8
 
     DEBUG_PRINTLN(F("[ZIGBEE-GW] Tuya DP write failed: scheduler queue full"));
     return false;
-}
-
-static void gw_queue_pending_switch(bool use_tuya, uint64_t ieee_addr, uint8_t endpoint, uint8_t dp_id, bool turnon) {
-    if (ieee_addr == 0) return;
-    gw_pending_switch.valid = true;
-    gw_pending_switch.use_tuya = use_tuya;
-    gw_pending_switch.ieee_addr = ieee_addr;
-    gw_pending_switch.endpoint = endpoint ? endpoint : 1;
-    gw_pending_switch.dp_id = dp_id ? dp_id : 1;
-    gw_pending_switch.turnon = turnon;
-    if (gw_pending_switch.attempts < 250) gw_pending_switch.attempts++;
-    gw_pending_switch.next_try_ms = millis() + 1000UL;
-    DEBUG_PRINTF(F("[ZIGBEE-GW] Queued deferred %s command: ieee=%016llX ep=%d state=%d attempt=%d\n"),
-                 use_tuya ? "Tuya-DP" : "On/Off",
-                 (unsigned long long)ieee_addr,
-                 gw_pending_switch.endpoint,
-                 turnon ? 1 : 0,
-                 gw_pending_switch.attempts);
 }
 
 // Try to normalize a possibly stale/truncated station IEEE against runtime
@@ -788,6 +813,49 @@ struct GwBindRequest {
 static std::vector<GwBindRequest> gw_bind_queue;
 static unsigned long gw_last_bind_req_ms = 0;
 #define GW_BIND_REQ_STAGGER_MS 600  // ms between successive bind sends
+// How long the coordinator keeps a pending unicast for a sleepy child
+// (macTransactionPersistenceTime).  0 = leave the 802.15.4 default (7.68 s).
+// Longer values were tested (60 s / 300 s): they did not help Third Reality
+// sensors (those never poll outside pairing) and 300 s exhausted the ZBOSS
+// buffer pool ("zb_bufpool_mult.c:1233" assertion) because every pending
+// Bind/ConfigReport/Read/station command occupies a buffer for that long.
+#ifndef GW_MAC_PERSISTENCE_S
+#define GW_MAC_PERSISTENCE_S 0
+#endif
+// Keepalive method the coordinator advertises to joining end devices (Parent
+// Information in the End Device Timeout Response).  1 = MAC Data Poll only:
+// a child then has to keep its parent alive with data polls, which are also
+// the moments it can receive queued commands.  2 = ED Timeout Request only,
+// 3 = both (ZBOSS default), 0 = none.  Experiment for sleepy GIEX valves that
+// otherwise never poll outside their own reports; takes effect at (re)join.
+#ifndef GW_KEEPALIVE_MODE
+#define GW_KEEPALIVE_MODE 1
+#endif
+// Default end-device timeout granted to children that do not request one.
+#ifndef GW_ED_TIMEOUT
+#define GW_ED_TIMEOUT ESP_ZB_ED_AGING_TIMEOUT_64MIN
+#endif
+extern "C" esp_err_t esp_zb_nwk_set_keepalive_mode(int mode);
+extern "C" esp_err_t esp_zb_nwk_set_ed_timeout(esp_zb_aging_timeout_t timeout);
+
+// Battery reporting (Power Configuration 0x0001 / BatteryPercentageRemaining
+// 0x0021).  Standard ZCL sleepy end devices (Third Reality, Sonoff, Aqara, ...)
+// only push battery reports after the coordinator has bound the cluster and
+// configured reporting — exactly what zigbee2mqtt's `battery()` extend does.
+// Bind + ConfigureReporting are queued through the regular queues above; the
+// one-time read below fetches the initial value while the device is awake.
+#define GW_BATTERY_REPORT_MIN_S 600     // at most one report per 10 min
+#define GW_BATTERY_REPORT_MAX_S 43200   // at least one report every 12 h
+#define GW_BATTERY_READ_RETRY_MS 3000   // retry spacing when the read slot is busy
+#define GW_BATTERY_READ_MAX_ATTEMPTS 3
+#define GW_BATTERY_SECOND_READ_MS 45000 // second read after a join (device still awake)
+struct GwBatteryReadRequest {
+    uint64_t ieee_addr;
+    uint8_t  endpoint;
+    uint8_t  attempts;
+    unsigned long scheduled_time;
+};
+static std::vector<GwBatteryReadRequest> gw_battery_read_queue;
 
 
 // Tuya manufacturer-specific cluster (manuSpecificTuya)
@@ -897,6 +965,10 @@ static void gw_process_basic_query_queue() {
     }
 
     if ((int32_t)(now - item.next_query_ms) < 0) return;
+    if (gw_station_ctl_pending_for(item.ieee_addr)) {
+        item.next_query_ms = now + 30000UL;  // station command first
+        return;
+    }
 
     bool is_tuya_dev = false;
     ZigbeeDeviceInfo* dev = gw_find_discovered_device(item.ieee_addr);
@@ -981,33 +1053,7 @@ static void gw_process_basic_query_queue() {
 #define TUYA_CMD_DATA_SEND      TUYA_CMD_DP_SEND
 #define TUYA_CMD_ACTIVE_STATUS  TUYA_CMD_DP_REPORT
 
-// Tuya DP data types
-#define TUYA_TYPE_RAW    0x00
-#define TUYA_TYPE_BOOL   0x01
-#define TUYA_TYPE_VALUE  0x02  // 4-byte big-endian integer
-#define TUYA_TYPE_STRING 0x03
-#define TUYA_TYPE_ENUM   0x04
-#define TUYA_TYPE_BITMAP 0x05
-
-// Flag to mark reports originating from Tuya DP parsing (value already scaled)
-#define TUYA_REPORT_FLAG_PRESCALED  0x8000
-#define TUYA_REPORT_TYPE_SHIFT      8
-#define TUYA_REPORT_TYPE_MASK       0x0F00
-#define TUYA_REPORT_DP_MASK         0x00FF
-
-static uint16_t tuya_report_attr(uint8_t dp_number, uint8_t dp_type) {
-    return TUYA_REPORT_FLAG_PRESCALED |
-           (((uint16_t)dp_type << TUYA_REPORT_TYPE_SHIFT) & TUYA_REPORT_TYPE_MASK) |
-           (uint16_t)dp_number;
-}
-
-static uint16_t zigbee_report_attr_id(uint16_t attr_id) {
-    return (attr_id & TUYA_REPORT_FLAG_PRESCALED) ? (attr_id & TUYA_REPORT_DP_MASK) : attr_id;
-}
-
-static uint8_t tuya_report_type(uint16_t attr_id) {
-    return (attr_id & TUYA_REPORT_FLAG_PRESCALED) ? (uint8_t)((attr_id & TUYA_REPORT_TYPE_MASK) >> TUYA_REPORT_TYPE_SHIFT) : 0;
-}
+// TUYA_TYPE_* and TUYA_REPORT_* live in sensor_zigbee_common.h
 
 static bool gw_is_ignorable_unmatched_tuya_dp(uint16_t dp, uint64_t ieee_addr) {
     // Primary check: if this DP is registered as a secondary channel on any
@@ -1068,51 +1114,6 @@ static bool gw_ieee_matches_station(uint64_t station_ieee, uint64_t report_ieee)
            (report_ieee >> 8) == station_ieee;
 }
 
-static uint32_t zigbee_battery_percent_from_report(bool is_tuya_report, uint16_t raw_attr_id, uint8_t tuya_type, int16_t configured_tuya_battery_dp, int32_t value) {
-    if (is_tuya_report) {
-        // DP 14 is specifically "battery_state" (ENUM): 0=normal/full, 1=low
-        if (raw_attr_id == 14) {
-            if (value == 0) return 100;
-            return 15;
-        }
-
-        // DP 59 is GX03 battery (typically percentage 0-100 or enum/steps)
-        if (raw_attr_id == 59) {
-            if (value > 4 && value <= 100) return (uint32_t)value;
-            if (value == 4) return 100;
-            if (value == 3) return 75;
-            if (value == 2) return 50;
-            if (value == 1) return 25;
-            if (value == 0) return 100; // default to 100 on communicating device
-        }
-
-        if (raw_attr_id == 15 || raw_attr_id == 108 || raw_attr_id == 115 || raw_attr_id == 18 || 
-            (configured_tuya_battery_dp >= 0 && raw_attr_id == (uint16_t)configured_tuya_battery_dp)) {
-            
-            if (tuya_type == TUYA_TYPE_ENUM) {
-                // 3-state enum: 0=high/normal, 1=medium, 2=low
-                // OR 3-state: 0=low, 1=medium, 2=high.
-                if (value == 0) return 100;
-                if (value == 1) return 50;
-                if (value == 2 || value == 3) return 100;
-                return 100;
-            }
-
-            if (value <= 0) {
-                return 100; // active device with 0 is uninitialized or inverted full
-            }
-            return (value > 100) ? 100 : (uint32_t)value;
-        }
-
-        if (value < 0) return 0;
-        return (value > 100) ? 100 : (uint32_t)value;
-    }
-
-    if (value < 0) return 0;
-    uint32_t batt_pct = (uint32_t)(value / 2);
-    return (batt_pct > 100) ? 100 : batt_pct;
-}
-
 // Custom Tuya and standard battery report parser helper
 
 // Lazy-loading report cache
@@ -1127,11 +1128,149 @@ struct ZigbeeAttributeReport {
     bool consumed;   // true once matched to a sensor — skip on next iteration
 };
 
-static constexpr size_t MAX_PENDING_REPORTS = 16;
+static constexpr size_t MAX_PENDING_REPORTS = 64;
 // Report cache is allocated in PSRAM to keep it off the scarce internal heap.
 static ZigbeeAttributeReport* pending_reports = nullptr;
 static size_t pending_report_count = 0;
 static constexpr unsigned long REPORT_VALIDITY_MS = 60000;
+
+// ---------------------------------------------------------------------------
+// RX ingress queue: Zigbee task -> main loop hand-off.
+//
+// Every ZBOSS/ZigbeeCore callback (attribute reports, Tuya APS frames, Basic
+// Cluster answers, device announces, command send status) runs in the Zigbee
+// task. Those callbacks used to touch the report cache, the discovered-device
+// vector, the station table (LittleFS reads!) and the sensor map directly,
+// which (a) raced against the main loop compacting the same structures and
+// (b) stalled the Zigbee stack for hundreds of milliseconds per frame, so
+// sleepy end devices missed their indirect-transmission window.
+// Now the callbacks only copy the raw frame data into this queue; everything
+// else happens in gw_rx_drain() from sensor_zigbee_gw_loop().
+// ---------------------------------------------------------------------------
+enum GwRxKind : uint8_t {
+    GW_RX_SEEN = 0,      // device sent a control frame (time sync, MCU version, ...)
+    GW_RX_ANNOUNCE,      // DEVICE_ANNCE / findEndpoint
+    GW_RX_ATTR,          // numeric ZCL attribute report / read response
+    GW_RX_TUYA_DP,       // one Tuya datapoint record
+    GW_RX_BASIC,         // Basic Cluster attribute (string or u8) response
+    GW_RX_SEND_STATUS,   // ZCL command send status (APS confirm)
+    GW_RX_DEFAULT_RESP,  // ZCL default response (cluster + status)
+};
+
+struct GwRxEvent {
+    uint8_t  kind;
+    uint8_t  endpoint;
+    uint16_t short_addr;
+    uint64_t ieee;
+    uint16_t cluster_id;
+    uint16_t attr_id;      // ZCL attribute id or Tuya DP number
+    int32_t  value;
+    uint8_t  lqi;
+    uint8_t  dp_type;      // Tuya DP type, or ZCL attribute type for GW_RX_BASIC
+    uint8_t  tsn;          // GW_RX_SEND_STATUS
+    int32_t  status;       // GW_RX_SEND_STATUS (esp_err_t)
+    uint8_t  raw_len;
+    uint8_t  raw[34];      // GW_RX_BASIC payload (ZCL string incl. length byte, or u8)
+};
+
+static constexpr UBaseType_t GW_RX_QUEUE_LEN = 96;
+static QueueHandle_t gw_rx_queue = nullptr;
+static uint32_t gw_rx_dropped = 0;
+
+static bool gw_rx_ensure_queue() {
+    if (gw_rx_queue) return true;
+    gw_rx_queue = xQueueCreateWithCaps(GW_RX_QUEUE_LEN, sizeof(GwRxEvent), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!gw_rx_queue) gw_rx_queue = xQueueCreate(GW_RX_QUEUE_LEN, sizeof(GwRxEvent));
+    return gw_rx_queue != nullptr;
+}
+
+// Called from Zigbee-task callbacks: never blocks, never touches shared state.
+static bool gw_rx_push(const GwRxEvent& ev) {
+    if (!gw_rx_queue) return false;
+    if (xQueueSend(gw_rx_queue, &ev, 0) != pdTRUE) {
+        gw_rx_dropped++;
+        return false;
+    }
+    return true;
+}
+
+static uint64_t gw_ieee_from_raw(const esp_zb_ieee_addr_t raw) {
+    uint64_t ieee = 0;
+    for (int i = 7; i >= 0; i--) ieee = (ieee << 8) | raw[i];
+    return ieee;
+}
+
+// Resolve the IEEE of a short address (stack call, valid in Zigbee context)
+// and queue a "device is awake" event for the main loop.
+static void gw_rx_push_seen_from_short(uint16_t short_addr, uint8_t endpoint) {
+    esp_zb_ieee_addr_t raw_ieee;
+    if (esp_zb_ieee_address_by_short(short_addr, raw_ieee) != ESP_OK) return;
+    uint64_t ieee = gw_ieee_from_raw(raw_ieee);
+    if (!ieee) return;
+    GwRxEvent ev = {};
+    ev.kind = GW_RX_SEEN;
+    ev.short_addr = short_addr;
+    ev.endpoint = endpoint;
+    ev.ieee = ieee;
+    gw_rx_push(ev);
+}
+
+static void gw_rx_push_tuya_dp(uint64_t ieee, uint16_t short_addr, uint8_t endpoint,
+                               uint8_t dp_number, uint8_t dp_type, int32_t value, uint8_t lqi) {
+    GwRxEvent ev = {};
+    ev.kind = GW_RX_TUYA_DP;
+    ev.short_addr = short_addr;
+    ev.endpoint = endpoint;
+    ev.ieee = ieee;
+    ev.cluster_id = ZB_ZCL_CLUSTER_ID_TUYA_SPECIFIC;
+    ev.attr_id = dp_number;
+    ev.dp_type = dp_type;
+    ev.value = value;
+    ev.lqi = lqi;
+    gw_rx_push(ev);
+}
+
+// Copy a Basic Cluster attribute (string or u8) so it can be processed later.
+static void gw_rx_push_basic(uint64_t ieee, uint16_t short_addr, uint8_t endpoint,
+                             const esp_zb_zcl_attribute_t *attribute) {
+    if (!attribute || !attribute->data.value) return;
+    GwRxEvent ev = {};
+    ev.kind = GW_RX_BASIC;
+    ev.short_addr = short_addr;
+    ev.endpoint = endpoint;
+    ev.ieee = ieee;
+    ev.cluster_id = ZB_ZCL_CLUSTER_ID_BASIC;
+    ev.attr_id = attribute->id;
+    ev.dp_type = (uint8_t)attribute->data.type;
+    const uint8_t* raw = (const uint8_t*)attribute->data.value;
+    size_t n = 0;
+    if (attribute->data.type == ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING) {
+        uint8_t len = raw[0];
+        if (len == 0xFF) len = 0;
+        n = (size_t)len + 1;
+        if (n > sizeof(ev.raw)) { n = sizeof(ev.raw); }
+        memcpy(ev.raw, raw, n);
+        ev.raw[0] = (uint8_t)(n - 1);           // clamp the length byte to what was copied
+    } else if (attribute->data.type == ESP_ZB_ZCL_ATTR_TYPE_LONG_CHAR_STRING) {
+        uint16_t len = raw[0] | ((uint16_t)raw[1] << 8);
+        if (len == 0xFFFF) len = 0;
+        n = (size_t)len + 2;
+        if (n > sizeof(ev.raw)) { n = sizeof(ev.raw); }
+        memcpy(ev.raw, raw, n);
+        uint16_t copied = (uint16_t)(n - 2);
+        ev.raw[0] = (uint8_t)(copied & 0xFF);
+        ev.raw[1] = (uint8_t)(copied >> 8);
+    } else {
+        n = 1;
+        ev.raw[0] = raw[0];
+    }
+    ev.raw_len = (uint8_t)n;
+    gw_rx_push(ev);
+}
+
+// Hook for the station switch state machine: "this device is awake right now".
+static void gw_station_ctl_on_device_rx(uint64_t ieee);
+static void gw_send_status_cb(esp_zb_zcl_command_send_status_message_t msg);
 
 // Lazily allocate the report cache in SPIRAM (falls back to internal RAM).
 static inline bool ensure_report_cache() {
@@ -1221,7 +1360,7 @@ static bool gw_cache_attribute_report(uint64_t ieee_addr, uint8_t endpoint,
 }
 
 // Forward declarations for functions used in class methods and device management
-static void gw_schedule_configure_reporting_for_ieee(uint64_t ieee, unsigned long delay_ms);
+static void gw_schedule_configure_reporting_for_ieee(uint64_t ieee, unsigned long delay_ms, bool force_battery = false);
 static void gw_schedule_default_configure_reporting(uint64_t ieee, uint8_t ep, unsigned long delay_ms);
 static bool gw_query_basic_cluster(uint16_t short_addr, uint8_t endpoint);
 
@@ -1326,6 +1465,7 @@ static void gw_add_responsive_device(uint16_t short_addr, uint64_t ieee_addr, ui
     info.hw_version = 0xFF;
     info.battery = 255;
     info.lqi = 0;
+    info.rssi = 0;
     
     gw_discovered_devices.push_back(info);
     gw_mark_discovered_devices_dirty();
@@ -1442,32 +1582,6 @@ bool sensor_zigbee_gw_rename_device(uint64_t ieee_addr, const char* new_name) {
 // ========== Tuya DP protocol handler (APS layer) ==========
 
 /**
- * @brief Extract a ZCL CHAR_STRING attribute into a C string buffer (GW mode)
- */
-static bool gw_extractStringAttribute(const esp_zb_zcl_attribute_t *attr, char *buf, size_t buf_size) {
-    if (!attr || !attr->data.value || buf_size == 0) return false;
-    
-    if (attr->data.type == ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING) {
-        uint8_t *raw = (uint8_t*)attr->data.value;
-        uint8_t len = raw[0];
-        if (len == 0xFF) { buf[0] = '\0'; return false; }
-        if (len >= buf_size) len = buf_size - 1;
-        memcpy(buf, raw + 1, len);
-        buf[len] = '\0';
-        return len > 0;
-    } else if (attr->data.type == ESP_ZB_ZCL_ATTR_TYPE_LONG_CHAR_STRING) {
-        uint8_t *raw = (uint8_t*)attr->data.value;
-        uint16_t len = raw[0] | ((uint16_t)raw[1] << 8);
-        if (len == 0xFFFF) { buf[0] = '\0'; return false; }
-        if (len >= buf_size) len = buf_size - 1;
-        memcpy(buf, raw + 2, len);
-        buf[len] = '\0';
-        return len > 0;
-    }
-    return false;
-}
-
-/**
  * @brief Handle Basic Cluster (0x0000) attribute read response in Gateway mode
  * Updates discovered device info and matching sensor configurations.
  */
@@ -1475,7 +1589,7 @@ static void gw_handleBasicClusterResponse(uint16_t short_addr, const esp_zb_zcl_
     if (!attribute || !attribute->data.value) return;
     
     char str_buf[32] = {0};
-    bool has_string = gw_extractStringAttribute(attribute, str_buf, sizeof(str_buf));
+    bool has_string = zigbee_extract_string_attribute(attribute, str_buf, sizeof(str_buf));
     bool has_u8 = (attribute->data.type == ESP_ZB_ZCL_ATTR_TYPE_U8);
     uint8_t u8_value = has_u8 ? *(uint8_t*)attribute->data.value : 0xFF;
     
@@ -1580,35 +1694,135 @@ static void gw_handleBasicClusterResponse(uint16_t short_addr, const esp_zb_zcl_
     }
 }
 
-// ========== Zigbee station switch-failure verification ==========
-// When a Tuya DP write is sent to a station, the expected state (ON/OFF)
-// and a timestamp are recorded.  When the device echoes the DP back (which
-// most Tuya valves do within a few seconds), the actual value is compared.
-// A mismatch — or no echo within ZB_VERIFY_TIMEOUT_MS — triggers an MQTT
-// alert on topic  station/{sid}/alert/switch.
+// ---------------------------------------------------------------------------
+// Station switch state machine: one entry per station.
+//
+// switch_zigbeestation() only records the desired state (latest command wins,
+// so an OFF always replaces a still-pending ON). The machine sends the command,
+// re-sends with backoff (6/15/30/60 s), re-sends immediately when the device
+// wakes up and talks to us (see gw_station_ctl_on_device_rx), evaluates the
+// APS confirm of every send (gw_station_ctl_on_send_status) and treats a Tuya
+// DP echo as the final confirmation. An OFF is never abandoned: after the
+// backoff ramp it keeps retrying once a minute until the valve confirms.
+// ---------------------------------------------------------------------------
+// Sleepy GIEX/Tuya valves choke on more than one queued command: every timed
+// retry that piles up in the coordinator's indirect queue is delivered in a
+// burst on the next poll and the valve MCU drops or misorders them.  So each
+// request is sent exactly ONCE; the only re-send is wake-triggered and only if
+// the previous frame provably never reached the device (APS send failure).
+// The ESP stack itself keeps an indirect frame alive (APS retries) for up to
+// ~40-60 s before reporting the send as failed, so a timed retry stacks a
+// second frame on top of the first.  Rule: at most ONE frame in flight per
+// station.  A re-send happens only after the send-status callback reported
+// the previous frame as NOT delivered (or on device wake in that same state).
+#define ZB_CTL_MAX_SENDS_TOTAL       20     // hard cap of re-sends per request (then wait for wake only)
+#define ZB_CTL_RESEND_AFTER_FAIL_MS 1000UL  // delay between "not delivered" and the re-send
+#define ZB_CTL_CONFIRM_TIMEOUT_MS  60000UL  // no confirmation within this -> "switch failed" alert (once)
+#define ZB_CTL_INFLIGHT_MAX_MS     60000UL  // after this a frame without send status is considered gone
+#define ZB_CTL_SEND_FAIL_RETRY_MS   1500UL  // spacing when the send itself was rejected (cooldown, no short addr)
+#define ZB_CTL_WAKE_MIN_GAP_MS      8000UL  // min gap between a send and a wake-triggered re-send (> 7.68 s indirect persistence)
+#define ZB_CTL_WAKE_ECHO_GRACE_MS   5000UL  // delivered (APS ack) but no DP echo yet: give the device this long
+#define ZB_CTL_ZCL_LEGACY_CONFIRM_MS 2000UL // ZCL without send-status support: assume delivered after this
 
-#define ZB_VERIFY_MAX        8
-#define ZB_VERIFY_TIMEOUT_MS 10000   // 10 s without echo → failure
-#define ZB_VERIFY_RETRY_MS    6000   // wait this long for an echo before re-sending (>= min send spacing)
-#define ZB_VERIFY_MAX_RETRIES    3   // number of re-sends before giving up
-#define ZB_VERIFY_QUERY_GRACE_MS 5000 // wait after an explicit DP query before failing
-
-struct ZbStationVerify {
-    uint64_t ieee;
-    uint8_t  dp_id;
-    bool     expected_on;
-    uint32_t sent_ms;
-    uint8_t  sid;
+struct ZbStationCtl {
+    bool     active;         // command outstanding, not yet confirmed
+    bool     desired_on;
+    uint8_t  ctrl_type;      // 0 = standard ZCL, 1 = Tuya DP, 2 = GIEX water valve
     uint8_t  endpoint;
-    uint8_t  ctrl_type;   // 0 = standard ZCL, 1 = Tuya DP, 2 = GIEX water valve
-    uint8_t  retries;
-    bool     pending;
+    uint8_t  dp_id;          // DP written (Tuya/GIEX)
+    uint8_t  verify_dp;      // DP that echoes the state
+    uint8_t  attempts;       // successful sends so far
+    uint8_t  send_fails;     // consecutive rejected sends (no short addr, cooldown, queue full)
+    uint8_t  last_tsn;
+    bool     have_tsn;
+    bool     delivered;      // APS confirm OK for the last send
+    bool     last_send_failed; // APS confirm reported the last send as NOT delivered
+    bool     resend_needed;  // desired state changed while a frame is still in flight
+    bool     inflight_on;    // state carried by the frame currently in flight
+    bool     error_flagged;  // "switch failed" already raised for this command
+    uint64_t ieee;
+    uint32_t requested_ms;
+    uint32_t last_sent_ms;
+    uint32_t next_try_ms;
+    uint16_t dur;            // runtime in seconds at request time (0 = unknown)
+    // Runtime channel from the device DB (Tuya): written in the same frame as ON
+    uint8_t  dp_runtime;     // 0 = none
+    uint8_t  runtime_unit;   // ZB_RT_UNIT_*
+    uint16_t runtime_max;
+    uint8_t  prereq_dp;      // 0 = none
+    int16_t  prereq_value;
 };
 
-static ZbStationVerify DRAM_ATTR zb_verify_table[ZB_VERIFY_MAX];
-static uint8_t DRAM_ATTR zb_station_switch_error[MAX_NUM_STATIONS];
-static uint8_t DRAM_ATTR zb_station_switch_waiting[MAX_NUM_STATIONS];
-static uint8_t DRAM_ATTR zb_station_physical_on[MAX_NUM_STATIONS];
+struct GwTuyaDpRecord {
+    uint8_t dp_id;
+    uint8_t dp_type;
+    uint8_t len;        // 1 (bool/enum) or 4 (value)
+    uint32_t value;     // big-endian on the wire
+};
+
+// Defined further down with the other Tuya senders.
+static bool gw_send_tuya_dp_records(uint64_t device_ieee, uint8_t endpoint,
+                                    const GwTuyaDpRecord* recs, uint8_t n_recs, bool urgent);
+static bool gw_send_tuya_dp_bool_write_cmd(uint64_t device_ieee, uint8_t endpoint, uint8_t dp_id, bool turnon,
+                                           uint8_t command_id, bool urgent);
+static uint8_t gw_giex_resolve_state_dp(uint64_t device_ieee, uint8_t dp_id);
+
+// Standard-ZCL devices that answered OnWithTimedOff with UNSUP_CLUSTER_COMMAND:
+// fall back to plain On for them (the station state machine still retries OFF).
+#define GW_ZCL_TIMED_OFF_UNSUP_MAX 16
+static PSRAM_BSS_ATTR uint64_t gw_zcl_timed_off_unsupported[GW_ZCL_TIMED_OFF_UNSUP_MAX];
+static uint64_t gw_last_timed_off_ieee = 0;
+static uint32_t gw_last_timed_off_ms = 0;
+
+static bool gw_zcl_timed_off_is_unsupported(uint64_t ieee) {
+    for (int i = 0; i < GW_ZCL_TIMED_OFF_UNSUP_MAX; i++) if (gw_zcl_timed_off_unsupported[i] == ieee) return true;
+    return false;
+}
+static void gw_zcl_timed_off_mark_unsupported(uint64_t ieee) {
+    if (!ieee || gw_zcl_timed_off_is_unsupported(ieee)) return;
+    for (int i = 0; i < GW_ZCL_TIMED_OFF_UNSUP_MAX; i++) {
+        if (gw_zcl_timed_off_unsupported[i] == 0) { gw_zcl_timed_off_unsupported[i] = ieee; return; }
+    }
+    gw_zcl_timed_off_unsupported[0] = ieee; // table full: overwrite the oldest slot
+}
+
+// Remaining runtime of a station command in seconds (0 = unknown / elapsed).
+static uint16_t gw_station_ctl_remaining_s(const ZbStationCtl& e) {
+    if (e.dur == 0) return 0;
+    uint32_t elapsed = (millis() - e.requested_ms) / 1000UL;
+    return (elapsed < e.dur) ? (uint16_t)(e.dur - elapsed) : 0;
+}
+
+// Convert seconds to the device's runtime unit and clamp to its range.
+static uint32_t gw_runtime_to_device_units(uint16_t seconds, uint8_t unit, uint16_t max_units) {
+    uint32_t v;
+    uint32_t def_max;
+    switch (unit) {
+        case ZB_RT_UNIT_MIN: v = ((uint32_t)seconds + 59U) / 60U;   def_max = 1440;  break;
+        case ZB_RT_UNIT_H:   v = ((uint32_t)seconds + 3599U) / 3600U; def_max = 24;  break;
+        default:             v = seconds;                             def_max = 86400; break;
+    }
+    uint32_t lim = max_units ? max_units : def_max;
+    if (v < 1) v = 1;
+    if (v > lim) v = lim;
+    return v;
+}
+
+// Accessed only from task context (main loop), never from an ISR or with the
+// flash cache disabled, so the tables can live in PSRAM.
+static PSRAM_BSS_ATTR ZbStationCtl zb_station_ctl[MAX_NUM_STATIONS];
+static PSRAM_BSS_ATTR uint8_t zb_station_switch_error[MAX_NUM_STATIONS];
+static PSRAM_BSS_ATTR uint8_t zb_station_switch_waiting[MAX_NUM_STATIONS];
+static PSRAM_BSS_ATTR uint8_t zb_station_physical_on[MAX_NUM_STATIONS];
+static bool gw_send_status_supported = false;  // set once the stack delivered its first send-status callback
+
+static uint32_t zb_ctl_backoff_ms(uint8_t attempts) {
+    static const uint16_t sched_s[] = {6, 15, 30, 60};
+    const uint8_t n = sizeof(sched_s) / sizeof(sched_s[0]);
+    uint8_t i = attempts ? (uint8_t)(attempts - 1) : 0;
+    if (i >= n) i = n - 1;
+    return (uint32_t)sched_s[i] * 1000UL;
+}
 
 static void gw_station_switch_error_set(uint8_t sid, bool error) {
     if (sid >= MAX_NUM_STATIONS) return;
@@ -1638,75 +1852,195 @@ static void gw_station_verify_publish_fail(uint8_t sid, bool expected_on, bool t
     os.mqtt.publish(topic, payload);
 }
 
-// Re-send the last ON/OFF command for a pending verification entry. Used when
-// the device echoes the wrong state (e.g. a stale report collided with our
-// command) or fails to echo within the retry window.
-static void gw_station_verify_resend(int idx) {
-    if (idx < 0 || idx >= ZB_VERIFY_MAX) return;
-    ZbStationVerify &e = zb_verify_table[idx];
-    DEBUG_PRINTF(F("[ZIGBEE-GW] Switch verify re-send: sid=%u dp=%u expected_on=%d attempt=%u\n"),
-                 (unsigned)e.sid, (unsigned)e.dp_id, e.expected_on ? 1 : 0,
-                 (unsigned)(e.retries + 1));
-    switch (e.ctrl_type) {
-        case 2: // GIEX water valve — re-assert the state DP (dur=0 keeps the target)
-            sensor_zigbee_send_giex_water_valve_state_with_dur(e.ieee, e.endpoint, e.expected_on, 0, e.dp_id);
-            break;
-        case 1: // Generic Tuya DP
-            sensor_zigbee_send_tuya_dp_write(e.ieee, e.endpoint, e.dp_id, e.expected_on);
-            break;
-        default: // Standard ZCL On/Off
-            sensor_zigbee_send_on_off(e.ieee, e.endpoint, e.expected_on);
-            break;
+static void gw_station_ctl_note_sent(uint8_t sid, uint8_t tsn) {
+    if (sid >= MAX_NUM_STATIONS) return;
+    ZbStationCtl &e = zb_station_ctl[sid];
+    e.last_tsn = tsn;
+    e.have_tsn = true;
+    e.last_sent_ms = millis();   // queued Tuya commands: count from the actual dispatch
+}
+
+static void gw_station_ctl_confirm(uint8_t sid, const char* how) {
+    ZbStationCtl &e = zb_station_ctl[sid];
+    e.active = false;
+    e.error_flagged = false;
+    gw_station_physical_state_set(sid, e.desired_on);
+    DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u switch confirmed (%s): on=%d attempts=%u\n"),
+                 (unsigned)sid, how, e.desired_on ? 1 : 0, (unsigned)e.attempts);
+}
+
+// Send (or re-send) the command for a station entry. `urgent` bypasses the
+// per-device cooldown and the global Tuya spacing.
+static bool gw_station_ctl_pending_for(uint64_t ieee) {
+    if (ieee == 0) return false;
+    for (uint8_t sid = 0; sid < MAX_NUM_STATIONS; sid++) {
+        const ZbStationCtl &e = zb_station_ctl[sid];
+        if (e.active && e.ieee == ieee) return true;
     }
-    e.retries++;
-    e.sent_ms = millis();
+    return false;
+}
+
+static bool gw_station_ctl_send(uint8_t sid, bool urgent) {
+    ZbStationCtl &e = zb_station_ctl[sid];
+    uint32_t now = millis();
+    e.have_tsn = false;
+    gw_ctl_sending_sid = sid;
+    bool ok = false;
+    uint16_t remaining_s = e.desired_on ? gw_station_ctl_remaining_s(e) : 0;
+    if (e.ctrl_type == 0) {
+        // Standard ZCL: OnWithTimedOff carries the runtime (falls back to On
+        // when the device rejected it before).
+        ok = sensor_zigbee_send_on_off(e.ieee, e.endpoint, e.desired_on, urgent, remaining_s);
+    } else {
+        uint8_t state_dp = (e.ctrl_type == 2) ? gw_giex_resolve_state_dp(e.ieee, e.dp_id) : e.dp_id;
+        if (e.desired_on && remaining_s > 0 && e.dp_runtime != 0) {
+            // ON with runtime: [mode prerequisite] + runtime + state in ONE frame.
+            GwTuyaDpRecord recs[3];
+            uint8_t n = 0;
+            if (e.prereq_dp != 0) {
+                recs[n++] = { e.prereq_dp, TUYA_TYPE_ENUM, 1, (uint32_t)(e.prereq_value & 0xFF) };
+            }
+            uint32_t rt = gw_runtime_to_device_units(remaining_s, e.runtime_unit, e.runtime_max);
+            recs[n++] = { e.dp_runtime, TUYA_TYPE_VALUE, 4, rt };
+            recs[n++] = { state_dp, TUYA_TYPE_BOOL, 1, 1 };
+            DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u ON with runtime %lu (unit %u) on dp=%u\n"),
+                         (unsigned)sid, (unsigned long)rt, (unsigned)e.runtime_unit, (unsigned)e.dp_runtime);
+            ok = gw_send_tuya_dp_records(e.ieee, e.endpoint, recs, n, urgent);
+        } else {
+            ok = gw_send_tuya_dp_bool_write_cmd(e.ieee, e.endpoint, state_dp, e.desired_on, TUYA_CMD_DATA_REQUEST, urgent);
+        }
+    }
+    gw_ctl_sending_sid = 0xFF;
+    if (ok) {
+        if (e.resend_needed) e.attempts = 0;  // deferred direction change: new command, fresh count
+        e.attempts++;
+        e.last_sent_ms = now;
+        e.delivered = false;
+        e.last_send_failed = false;
+        e.resend_needed = false;
+        e.inflight_on = e.desired_on;
+        e.next_try_ms = now + zb_ctl_backoff_ms(e.attempts);
+        DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u %s sent (attempt %u%s), next check in %lus\n"),
+                     (unsigned)sid, e.desired_on ? "ON" : "OFF", (unsigned)e.attempts,
+                     urgent ? ", wake-triggered" : "", (unsigned long)(zb_ctl_backoff_ms(e.attempts) / 1000UL));
+        e.send_fails = 0;
+    } else {
+        // Rejected before it left the stack (unknown short address, cooldown,
+        // scheduler full): retry with exponential backoff 1.5 s ... 48 s so a
+        // station bound to an absent device does not busy-loop. Any frame from
+        // the device (wake trigger) short-cuts the wait.
+        if (e.send_fails < 16) e.send_fails++;
+        uint8_t shift = (e.send_fails > 6) ? 5 : (uint8_t)(e.send_fails - 1);
+        e.next_try_ms = now + (ZB_CTL_SEND_FAIL_RETRY_MS << shift);
+    }
+    return ok;
 }
 
 // Called from gw_cache_tuya_dp_report when a Tuya DP is received.
 static void gw_station_verify_process(uint64_t ieee, uint8_t dp_id, bool actual_on) {
+    for (uint8_t sid = 0; sid < MAX_NUM_STATIONS; sid++) {
+        ZbStationCtl &e = zb_station_ctl[sid];
+        if (!e.active || e.ieee != ieee) continue;
+        if (e.ctrl_type == 0) continue;  // standard ZCL is confirmed via APS ack / On/Off attribute
 
-    for (int i = 0; i < ZB_VERIFY_MAX; i++) {
-        if (!zb_verify_table[i].pending) continue;
-        if (zb_verify_table[i].ieee  != ieee)  continue;
-
-        bool match_state = (zb_verify_table[i].dp_id == dp_id);
+        bool match_state = (e.verify_dp == dp_id);
 
         // GIEX water valves frequently confirm a *stop* via a completion data
         // point instead of echoing the state DP = 0: DP1 (mode/state) = 0, the
         // countdown DP107 reaching 0, or a DP111 last-irrigation report. Accept
         // those as an OFF confirmation so a closed valve does not stay "red".
-        bool giex_off = (zb_verify_table[i].ctrl_type == 2 &&
-                         zb_verify_table[i].expected_on == false &&
+        bool giex_off = (e.ctrl_type == 2 && !e.desired_on &&
                          ((dp_id == 1   && !actual_on) ||
                           (dp_id == 107 && !actual_on) ||
                           (dp_id == 111)));
-
         if (!match_state && !giex_off) continue;
 
-        bool confirmed = match_state ? (zb_verify_table[i].expected_on == actual_on) : true;
-
+        bool confirmed = match_state ? (e.desired_on == actual_on) : true;
+        if (!confirmed && e.resend_needed && actual_on == e.inflight_on) {
+            // The device applied the frame that was in flight and is awake:
+            // send the deferred (opposite) state immediately.
+            DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u echoed in-flight state on=%d -> sending deferred %s\n"),
+                         (unsigned)sid, actual_on ? 1 : 0, e.desired_on ? "ON" : "OFF");
+            gw_station_physical_state_set(sid, actual_on);
+            gw_station_ctl_send(sid, true);
+            return;
+        }
         if (confirmed) {
-            // The device report confirms the requested state.
-            zb_verify_table[i].pending = false;
-            gw_station_physical_state_set(zb_verify_table[i].sid, zb_verify_table[i].expected_on);
-            DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u switch confirmed: dp=%u on=%d%s\n"),
-                         (unsigned)zb_verify_table[i].sid, (unsigned)dp_id,
-                         zb_verify_table[i].expected_on ? 1 : 0,
-                         giex_off ? " (via completion DP)" : "");
-        } else if (zb_verify_table[i].retries < ZB_VERIFY_MAX_RETRIES) {
-            // Wrong state reported (or a stale report collided with our command) —
-            // re-send the same ON/OFF command and keep verifying.
-            DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u switch mismatch (got on=%d want on=%d) -> re-send\n"),
-                         (unsigned)zb_verify_table[i].sid, actual_on ? 1 : 0,
-                         zb_verify_table[i].expected_on ? 1 : 0);
-            gw_station_verify_resend(i);
+            gw_station_ctl_confirm(sid, giex_off ? "completion DP" : "DP echo");
         } else {
-            // Retry budget exhausted — mark as failed.
-            zb_verify_table[i].pending = false;
-            gw_station_verify_publish_fail(zb_verify_table[i].sid,
-                                           zb_verify_table[i].expected_on, false);
+            // Wrong state reported (or a stale report collided with our
+            // command): re-send on the next tick.
+            DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u switch mismatch (got on=%d want on=%d) -> re-send\n"),
+                         (unsigned)sid, actual_on ? 1 : 0, e.desired_on ? 1 : 0);
+            e.next_try_ms = millis();
         }
         return;
+    }
+}
+
+// Wake trigger: the device just sent us a frame, so it is awake and listening.
+// Re-send any outstanding command for it right now.
+static void gw_station_ctl_on_device_rx(uint64_t ieee) {
+    if (ieee == 0) return;
+    uint32_t now = millis();
+    for (uint8_t sid = 0; sid < MAX_NUM_STATIONS; sid++) {
+        ZbStationCtl &e = zb_station_ctl[sid];
+        if (!e.active || e.ieee != ieee) continue;
+        if (e.last_sent_ms != 0 && (now - e.last_sent_ms) < ZB_CTL_WAKE_MIN_GAP_MS) continue;
+        if (e.delivered && (now - e.last_sent_ms) < ZB_CTL_WAKE_ECHO_GRACE_MS) continue; // it has the command, echo pending
+        // Never push a second copy of a command the device may already hold:
+        // re-send on wake only if nothing was sent yet or the APS layer
+        // reported the last frame as not delivered.
+        if (e.attempts > 0 && !e.last_send_failed) continue;
+        gw_station_ctl_send(sid, true);
+        break; // one urgent send per frame; the next frame triggers the next station
+    }
+}
+
+// APS confirm for a command we sent (from the send-status callback).
+static void gw_station_ctl_on_send_status(uint8_t tsn, int32_t status, uint16_t short_addr) {
+    (void)short_addr;
+    gw_send_status_supported = true;
+    for (uint8_t sid = 0; sid < MAX_NUM_STATIONS; sid++) {
+        ZbStationCtl &e = zb_station_ctl[sid];
+        if (!e.active || !e.have_tsn || e.last_tsn != tsn) continue;
+        if (status == ESP_OK) {
+            e.delivered = true;
+            if (e.resend_needed) {
+                // The device just acked the previous frame, so it is awake and
+                // the indirect queue is empty: send the deferred state now.
+                DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u in-flight frame acked -> sending deferred %s\n"),
+                             (unsigned)sid, e.desired_on ? "ON" : "OFF");
+                gw_station_ctl_send(sid, true);
+                return;
+            }
+            if (e.ctrl_type == 0) {
+                // No DP echo on standard ZCL devices: the APS ack is the confirmation.
+                gw_station_ctl_confirm(sid, "APS ack");
+            }
+        } else {
+            // Not delivered (device did not poll within the indirect window).
+            // No timed retry: the next frame from the device (wake trigger)
+            // re-sends it, see gw_station_ctl_on_device_rx().
+            DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u send status 0x%lx (not delivered) -> re-send (stack gave up, nothing in flight)\n"),
+                         (unsigned)sid, (unsigned long)status);
+            e.delivered = false;
+            e.last_send_failed = true;
+            e.next_try_ms = millis() + ZB_CTL_RESEND_AFTER_FAIL_MS;
+        }
+        return;
+    }
+}
+
+// OnWithTimedOff was rejected: re-send the desired state as a plain On.
+static void gw_station_ctl_on_timed_off_rejected(uint64_t ieee) {
+    for (uint8_t sid = 0; sid < MAX_NUM_STATIONS; sid++) {
+        ZbStationCtl &e = zb_station_ctl[sid];
+        if (e.ieee != ieee || !e.desired_on || e.ctrl_type != 0) continue;
+        if ((millis() - e.requested_ms) > 60000UL) continue;
+        DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u: OnWithTimedOff unsupported -> plain On\n"), (unsigned)sid);
+        e.active = true;
+        e.next_try_ms = millis();
     }
 }
 
@@ -1721,7 +2055,7 @@ static void gw_station_physical_state_set(uint8_t sid, bool actual_on) {
 
     zb_station_physical_on[sid] = actual_on ? 1 : 0;
 
-    DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u physical state from Tuya DP: on=%d\n"),
+    DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u physical state from device: on=%d\n"),
                  (unsigned)sid, actual_on ? 1 : 0);
 }
 
@@ -2087,9 +2421,15 @@ static void gw_load_tuya_seq() {
 }
 
 static void gw_zigbee_default_response_cb(zb_cmd_type_t resp_to_cmd, esp_zb_zcl_status_t status, uint8_t endpoint, uint16_t cluster) {
-    if (cluster != ZB_ZCL_CLUSTER_ID_TUYA_SPECIFIC) return;
-    DEBUG_PRINTF(F("[ZIGBEE-GW][ZCL] Default response: cluster=0x%04X ep=%u resp_to_cmd=0x%02X status=0x%02X\n"),
-                 cluster, endpoint, (unsigned)resp_to_cmd, (unsigned)status);
+    // Zigbee task: only hand the fact over to the main loop.
+    (void)resp_to_cmd;
+    if (cluster != ZB_ZCL_CLUSTER_ID_TUYA_SPECIFIC && cluster != ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) return;
+    GwRxEvent ev = {};
+    ev.kind = GW_RX_DEFAULT_RESP;
+    ev.endpoint = endpoint;
+    ev.cluster_id = cluster;
+    ev.status = (int32_t)status;
+    gw_rx_push(ev);
 }
 
 static uint16_t gw_next_tuya_seq() {
@@ -2357,7 +2697,7 @@ bool sensor_zigbee_gw_query_device_data(uint64_t device_ieee, uint8_t endpoint) 
 #define GW_TUYA_DEDUP_MAX        12
 #define GW_TUYA_DEDUP_WINDOW_MS 5000
 struct GwTuyaDedup { uint16_t short_addr; uint32_t hash; uint32_t last_ms; bool used; };
-static GwTuyaDedup DRAM_ATTR gw_tuya_dedup[GW_TUYA_DEDUP_MAX];
+static PSRAM_BSS_ATTR GwTuyaDedup gw_tuya_dedup[GW_TUYA_DEDUP_MAX];
 
 // FNV-1a hash of the Tuya DP records (skips the ZCL header and the 2-byte Tuya
 // transaction sequence, which change between otherwise-identical retransmits).
@@ -2402,6 +2742,42 @@ static bool gw_tuya_frame_is_duplicate(uint16_t short_addr, uint32_t payload_has
     return false;
 }
 
+
+// Mark a device as Tuya (so the loop can send periodic DP queries) and give it
+// a generic model when the Basic Cluster interview has not completed yet.
+// Runs in the main loop (called from gw_rx_drain()).
+static void gw_mark_tuya_device(uint64_t ieee_addr) {
+    // Mark this device as a Tuya device (so the loop can send periodic DP queries)
+for (auto& dev : gw_discovered_devices) {
+    if (dev.ieee_addr == ieee_addr) {
+        bool dirty = false;
+        if (!dev.is_tuya) {
+            dev.is_tuya = true;
+            dirty = true;
+        }
+        // If the model identifier is still unknown, apply a generic Tuya
+        // model ("TS0601") so per-DP sensor handling can proceed. We must
+        // NOT invent a manufacturer string here: stamping a concrete
+        // manufacturer (previously the GX02 valve's "_TZE200_sh1btabb")
+        // makes gw_device_needs_basic_info() return false, which suppresses
+        // the real Basic Cluster query forever — so EVERY unidentified Tuya
+        // device ended up mislabeled as a "GIEX GX02 Water Valve" in /zd and
+        // the UI/database name lookup. Leaving the manufacturer empty keeps
+        // the Basic Cluster query active so the real manufacturer is filled
+        // in (and the database can then provide the correct device name).
+        if (dev.model_id[0] == '\0' || strcmp(dev.model_id, "unknown") == 0) {
+            DEBUG_PRINTF(F("[ZIGBEE-GW][TUYA] Received Tuya DP on device with unknown model ieee=%016llX. Applying generic TS0601 model (manufacturer left empty for Basic Cluster resolution).\n"),
+                         (unsigned long long)ieee_addr);
+            strncpy(dev.model_id, "TS0601", sizeof(dev.model_id) - 1);
+            dev.model_id[sizeof(dev.model_id) - 1] = '\0';
+            dirty = true;
+        }
+        if (dirty) gw_mark_discovered_devices_dirty();
+        break;
+    }
+}
+}
+
 static bool gw_tuya_aps_indication_handler(esp_zb_apsde_data_ind_t ind) {
     // Log ALL incoming APS frames for debugging
     // DEBUG_PRINTF(F("[ZIGBEE-GW][APS] Indication: cluster=0x%04X src=0x%04X ep=%d len=%u prof=0x%04X\n"),
@@ -2431,12 +2807,7 @@ static bool gw_tuya_aps_indication_handler(esp_zb_apsde_data_ind_t ind) {
         // DEBUG_PRINTF(F("[ZIGBEE-GW][TUYA] Time sync request from 0x%04X\n"), ind.src_short_addr);
         gw_tuya_send_time_sync(ind.src_short_addr, ind.src_endpoint, seq_number);
         // Resolve IEEE from stack and add as responsive device
-        esp_zb_ieee_addr_t raw_ieee;
-        if (esp_zb_ieee_address_by_short(ind.src_short_addr, raw_ieee) == ESP_OK) {
-            uint64_t ieee = 0;
-            for (int i = 7; i >= 0; i--) ieee = (ieee << 8) | raw_ieee[i];
-            if (ieee) gw_add_responsive_device(ind.src_short_addr, ieee, ind.src_endpoint);
-        }
+        gw_rx_push_seen_from_short(ind.src_short_addr, ind.src_endpoint);
         return true;
     }
 
@@ -2446,24 +2817,14 @@ static bool gw_tuya_aps_indication_handler(esp_zb_apsde_data_ind_t ind) {
         // DEBUG_PRINTF(F("[ZIGBEE-GW][TUYA] MCU version request from 0x%04X\n"), ind.src_short_addr);
         gw_tuya_send_mcu_version_resp(ind.src_short_addr, ind.src_endpoint, seq_number);
         // Resolve IEEE from stack and add as responsive device
-        esp_zb_ieee_addr_t raw_ieee;
-        if (esp_zb_ieee_address_by_short(ind.src_short_addr, raw_ieee) == ESP_OK) {
-            uint64_t ieee = 0;
-            for (int i = 7; i >= 0; i--) ieee = (ieee << 8) | raw_ieee[i];
-            if (ieee) gw_add_responsive_device(ind.src_short_addr, ieee, ind.src_endpoint);
-        }
+        gw_rx_push_seen_from_short(ind.src_short_addr, ind.src_endpoint);
         return true;
     }
 
     // Some Tuya firmwares send MCU version response (0x11) spontaneously
     // during interview/keepalive. Treat it as a known non-DP control frame.
     if (command_id == TUYA_CMD_MCU_VERSION_RESP) {
-        esp_zb_ieee_addr_t raw_ieee;
-        if (esp_zb_ieee_address_by_short(ind.src_short_addr, raw_ieee) == ESP_OK) {
-            uint64_t ieee = 0;
-            for (int i = 7; i >= 0; i--) ieee = (ieee << 8) | raw_ieee[i];
-            if (ieee) gw_add_responsive_device(ind.src_short_addr, ieee, ind.src_endpoint);
-        }
+        gw_rx_push_seen_from_short(ind.src_short_addr, ind.src_endpoint);
         return true;
     }
 
@@ -2478,12 +2839,7 @@ static bool gw_tuya_aps_indication_handler(esp_zb_apsde_data_ind_t ind) {
         }
         // DEBUG_PRINTF(F("[ZIGBEE-GW][TUYA] DP query from 0x%04X - sending query now\n"), ind.src_short_addr);
         // Resolve IEEE from stack and add as responsive device
-        esp_zb_ieee_addr_t raw_ieee;
-        if (esp_zb_ieee_address_by_short(ind.src_short_addr, raw_ieee) == ESP_OK) {
-            uint64_t ieee = 0;
-            for (int i = 7; i >= 0; i--) ieee = (ieee << 8) | raw_ieee[i];
-            if (ieee) gw_add_responsive_device(ind.src_short_addr, ieee, ind.src_endpoint);
-        }
+        gw_rx_push_seen_from_short(ind.src_short_addr, ind.src_endpoint);
         // Send DP query directly
         gw_tuya_send_dp_query(ind.src_short_addr, ind.src_endpoint);
         return true;
@@ -2537,43 +2893,12 @@ static bool gw_tuya_aps_indication_handler(esp_zb_apsde_data_ind_t ind) {
     esp_zb_ieee_addr_t raw_ieee;
     uint64_t ieee_addr = 0;
     if (esp_zb_ieee_address_by_short(ind.src_short_addr, raw_ieee) == ESP_OK) {
-        for (int i = 7; i >= 0; i--) ieee_addr = (ieee_addr << 8) | raw_ieee[i];
-        if (ieee_addr) gw_add_responsive_device(ind.src_short_addr, ieee_addr, ind.src_endpoint);
+        ieee_addr = gw_ieee_from_raw(raw_ieee);
     }
 
     if (!ieee_addr) {
         // DEBUG_PRINTF(F("[ZIGBEE-GW][TUYA] Could not resolve IEEE for short=0x%04X\n"), ind.src_short_addr);
         return true;
-    }
-
-    // Mark this device as a Tuya device (so the loop can send periodic DP queries)
-    for (auto& dev : gw_discovered_devices) {
-        if (dev.ieee_addr == ieee_addr) {
-            bool dirty = false;
-            if (!dev.is_tuya) {
-                dev.is_tuya = true;
-                dirty = true;
-            }
-            // If the model identifier is still unknown, apply a generic Tuya
-            // model ("TS0601") so per-DP sensor handling can proceed. We must
-            // NOT invent a manufacturer string here: stamping a concrete
-            // manufacturer (previously the GX02 valve's "_TZE200_sh1btabb")
-            // makes gw_device_needs_basic_info() return false, which suppresses
-            // the real Basic Cluster query forever — so EVERY unidentified Tuya
-            // device ended up mislabeled as a "GIEX GX02 Water Valve" in /zd and
-            // the UI/database name lookup. Leaving the manufacturer empty keeps
-            // the Basic Cluster query active so the real manufacturer is filled
-            // in (and the database can then provide the correct device name).
-            if (dev.model_id[0] == '\0' || strcmp(dev.model_id, "unknown") == 0) {
-                DEBUG_PRINTF(F("[ZIGBEE-GW][TUYA] Received Tuya DP on device with unknown model ieee=%016llX. Applying generic TS0601 model (manufacturer left empty for Basic Cluster resolution).\n"),
-                             (unsigned long long)ieee_addr);
-                strncpy(dev.model_id, "TS0601", sizeof(dev.model_id) - 1);
-                dev.model_id[sizeof(dev.model_id) - 1] = '\0';
-                dirty = true;
-            }
-            if (dirty) gw_mark_discovered_devices_dirty();
-            break;
-        }
     }
 
     // DEBUG_PRINTF(F("[ZIGBEE-GW][TUYA] Processing DP frame: cmd=0x%02X len=%u src=0x%04X\n"),
@@ -2615,7 +2940,7 @@ static bool gw_tuya_aps_indication_handler(esp_zb_apsde_data_ind_t ind) {
 
         // Always cache raw Tuya DP reports (cluster 0xEF00, attr=DP id)
         // so per-sensor custom DP mappings can consume them.
-        gw_cache_tuya_dp_report(ieee_addr, ind.src_endpoint, dp_number, dp_value, ind.lqi, dp_type);
+        gw_rx_push_tuya_dp(ieee_addr, ind.src_short_addr, ind.src_endpoint, dp_number, dp_type, dp_value, ind.lqi);
 
         offset += dp_len;
         dps_parsed++;
@@ -2632,7 +2957,15 @@ static bool gw_tuya_aps_indication_handler(esp_zb_apsde_data_ind_t ind) {
 
 // Return ZCL attribute data type for the MeasuredValue (0x0000) attribute
 // of standard measurement clusters. Required by Configure Reporting command.
-static uint8_t gw_cluster_attr_type(uint16_t cluster_id) {
+static uint8_t gw_attr_type(uint16_t cluster_id, uint16_t attr_id) {
+    // Power Configuration: BatteryVoltage (0x0020) and
+    // BatteryPercentageRemaining (0x0021) are uint8.  A Configure Reporting
+    // record with the wrong data type is rejected by the device
+    // (INVALID_DATA_TYPE), so the type must be attribute-aware here.
+    if (cluster_id == ZB_ZCL_CLUSTER_ID_POWER_CONFIG &&
+        (attr_id == 0x0020 || attr_id == 0x0021)) {
+        return 0x20; // uint8 (U8)
+    }
     switch (cluster_id) {
         case ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT:     return 0x29; // int16 (S16)
         case ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT: return 0x29; // int16 (S16)
@@ -2720,7 +3053,7 @@ bool sensor_zigbee_gw_configure_reporting(uint64_t device_ieee, uint8_t endpoint
     memset(&record, 0, sizeof(record));
     record.direction    = ESP_ZB_ZCL_REPORT_DIRECTION_SEND;
     record.attributeID  = attr_id;
-    record.attrType     = gw_cluster_attr_type(cluster_id);
+    record.attrType     = gw_attr_type(cluster_id, attr_id);
     record.min_interval = min_interval;
     record.max_interval = max_interval;
     record.reportable_change = &delta_val;
@@ -2753,11 +3086,173 @@ bool sensor_zigbee_gw_configure_reporting(uint64_t device_ieee, uint8_t endpoint
     return true;
 }
 
-static void gw_schedule_configure_reporting_for_ieee(uint64_t ieee, unsigned long delay_ms) {
+// Per-device throttle for the battery setup.  The per-IEEE scheduler below is
+// invoked on every incoming frame of a known device, so without this gate a
+// sleepy sensor would get a Bind + ConfigureReporting + Read on every report.
+// A sleepy device only receives the unicast Bind/ConfigureReporting if it
+// polls its parent within the indirect-transmission window (~7.7 s), which is
+// not guaranteed after a report.  So retry on the device's frames: the first
+// GW_BATTERY_FAST_ATTEMPTS at >= GW_BATTERY_FAST_SPACING_MS, afterwards once
+// per GW_BATTERY_SLOW_SPACING_MS.  The initial read is sent only once (the
+// single active-read slot is too valuable to burn on every retry).
+#define GW_BATTERY_FAST_ATTEMPTS      3
+#define GW_BATTERY_FAST_SPACING_MS    (120UL * 1000UL)
+#define GW_BATTERY_SLOW_SPACING_MS    (60UL * 60UL * 1000UL)
+#define GW_BATTERY_MAX_TRACKED 32
+struct GwBatteryAttempt {
+    uint64_t ieee_addr;
+    unsigned long last_ms;
+    uint8_t  attempts;
+};
+static std::vector<GwBatteryAttempt> gw_battery_attempts;
+
+// Returns the attempt number (1 = first) or 0 when throttled.
+static uint8_t gw_battery_attempt_allowed(uint64_t ieee, unsigned long now) {
+    for (auto& a : gw_battery_attempts) {
+        if (a.ieee_addr == ieee) {
+            unsigned long spacing = (a.attempts < GW_BATTERY_FAST_ATTEMPTS)
+                                        ? GW_BATTERY_FAST_SPACING_MS : GW_BATTERY_SLOW_SPACING_MS;
+            if (now - a.last_ms < spacing) return 0;
+            a.last_ms = now;
+            if (a.attempts < 255) a.attempts++;
+            return a.attempts;
+        }
+    }
+    if (gw_battery_attempts.size() >= GW_BATTERY_MAX_TRACKED) {
+        gw_battery_attempts.erase(gw_battery_attempts.begin());
+    }
+    gw_battery_attempts.push_back({ieee, now, 1});
+    return 1;
+}
+
+// Queue Bind + ConfigureReporting for Power Configuration / battery percentage
+// and a one-time initial read.  Returns the delay after the last queued item.
+// Tuya (0xEF00) devices deliver battery as a DP and usually do not implement
+// cluster 0x0001, so they are skipped.
+//   force=true  : (re)join — always queue (device is awake and may have lost
+//                 its binding table).
+//   force=false : opportunistic — only while the battery is still unknown and
+//                 at most once per hour per device.
+static unsigned long gw_queue_battery_reporting(uint64_t ieee, uint8_t ep, unsigned long delay_ms, bool force) {
+    if (ieee == 0) return delay_ms;
+    ZigbeeDeviceInfo* dev = gw_find_discovered_device(ieee);
+    if (dev && dev->is_tuya) return delay_ms;
+    if (!force && dev && dev->battery != 255) return delay_ms;
+
+    unsigned long now = millis();
+    uint8_t attempt = gw_battery_attempt_allowed(ieee, now);
+    if (attempt == 0 && !force) return delay_ms;
+    bool with_read = force || attempt == 1;
+    DEBUG_PRINTF(F("[ZIGBEE-GW] Battery setup (0x0001/0x0021) queued for ieee=%016llX ep=%u force=%d attempt=%u read=%d delay=%lums\n"),
+                 (unsigned long long)ieee, (unsigned)ep, force ? 1 : 0, (unsigned)attempt, with_read ? 1 : 0, delay_ms);
+
+    bool bind_found = false;
+    for (const auto& ex : gw_bind_queue) {
+        if (ex.ieee_addr == ieee && ex.cluster_id == ZB_ZCL_CLUSTER_ID_POWER_CONFIG) {
+            bind_found = true;
+            break;
+        }
+    }
+    if (!bind_found) {
+        GwBindRequest bind_req;
+        bind_req.ieee_addr = ieee;
+        bind_req.endpoint = ep;
+        bind_req.cluster_id = ZB_ZCL_CLUSTER_ID_POWER_CONFIG;
+        bind_req.scheduled_time = now + delay_ms;
+        gw_bind_queue.push_back(bind_req);
+        delay_ms += 150;
+    }
+
+    bool cr_found = false;
+    for (const auto& ex : gw_config_report_queue) {
+        if (ex.ieee_addr == ieee && ex.cluster_id == ZB_ZCL_CLUSTER_ID_POWER_CONFIG && ex.attr_id == 0x0021) {
+            cr_found = true;
+            break;
+        }
+    }
+    if (!cr_found) {
+        GwConfigReportRequest req;
+        req.ieee_addr      = ieee;
+        req.endpoint       = ep;
+        req.cluster_id     = ZB_ZCL_CLUSTER_ID_POWER_CONFIG;
+        req.attr_id        = 0x0021;
+        req.min_interval   = GW_BATTERY_REPORT_MIN_S;
+        req.max_interval   = GW_BATTERY_REPORT_MAX_S;
+        req.scheduled_time = now + delay_ms;
+        gw_config_report_queue.push_back(req);
+        delay_ms += 700;
+    }
+
+    if (!with_read) return delay_ms;
+
+    bool rd_found = false;
+    for (const auto& ex : gw_battery_read_queue) {
+        if (ex.ieee_addr == ieee) {
+            rd_found = true;
+            break;
+        }
+    }
+    if (!rd_found) {
+        GwBatteryReadRequest rd;
+        rd.ieee_addr      = ieee;
+        rd.endpoint       = ep;
+        rd.attempts       = 0;
+        rd.scheduled_time = now + delay_ms + 1500;
+        gw_battery_read_queue.push_back(rd);
+        if (force) {
+            // Right after a (re)join many devices answer 0x0021 with 0 (not
+            // measured yet) but stay awake for a while.  A second read a bit
+            // later usually returns the real level.
+            rd.scheduled_time = now + delay_ms + GW_BATTERY_SECOND_READ_MS;
+            gw_battery_read_queue.push_back(rd);
+        }
+    }
+    return delay_ms;
+}
+
+// Drain the battery read queue: one read per loop tick, only when the single
+// active-read slot is free.  Rate-limited sends are retried a few times.
+static void gw_process_battery_read_queue() {
+    if (gw_battery_read_queue.empty()) return;
+    if (gw_read_pending) return;
+    unsigned long now = millis();
+    for (auto it = gw_battery_read_queue.begin(); it != gw_battery_read_queue.end(); ++it) {
+        if ((long)(now - it->scheduled_time) < 0) continue;
+        bool sent = sensor_zigbee_gw_read_attribute(it->ieee_addr, it->endpoint,
+                                                    ZB_ZCL_CLUSTER_ID_POWER_CONFIG, 0x0021);
+        if (sent || ++it->attempts >= GW_BATTERY_READ_MAX_ATTEMPTS) {
+            gw_battery_read_queue.erase(it);
+        } else {
+            it->scheduled_time = now + GW_BATTERY_READ_RETRY_MS;
+        }
+        break;
+    }
+}
+
+static void gw_schedule_configure_reporting_for_ieee(uint64_t ieee, unsigned long delay_ms, bool force_battery) {
     if (ieee == 0) return;
     SensorIterator it = sensors_iterate_begin();
     SensorBase* s;
     unsigned long now = millis();
+
+    // Battery setup goes out first and without delay: a sleepy device that
+    // just sent a frame only polls its parent for a short moment.
+    uint8_t battery_ep = 0;  // endpoint used for the battery bind/report (0 = none)
+    while ((s = sensors_iterate_next(it)) != NULL) {
+        if (!s || s->type != SENSOR_ZIGBEE) continue;
+        ZigbeeSensor* zb = static_cast<ZigbeeSensor*>(s);
+        if (zb->device_ieee != ieee) continue;
+        if (zb->cluster_id == ZB_ZCL_CLUSTER_ID_TUYA_SPECIFIC) {
+            battery_ep = 0;  // Tuya device: battery comes via DP, never via 0x0001
+            break;
+        }
+        if (battery_ep == 0) battery_ep = zb->endpoint ? zb->endpoint : 1;
+    }
+    if (battery_ep != 0) {
+        gw_queue_battery_reporting(ieee, battery_ep, 0, force_battery);
+    }
+
+    it = sensors_iterate_begin();
     while ((s = sensors_iterate_next(it)) != NULL) {
         if (!s || s->type != SENSOR_ZIGBEE) continue;
         ZigbeeSensor* zb = static_cast<ZigbeeSensor*>(s);
@@ -2867,6 +3362,7 @@ static void gw_schedule_default_configure_reporting(uint64_t ieee, uint8_t ep, u
         gw_config_report_queue.push_back(req);
         delay_ms += 700;
     }
+    delay_ms = gw_queue_battery_reporting(ieee, ep, delay_ms, true);
     DEBUG_PRINTF(F("[ZIGBEE-GW] Queued default Bind & ConfigReport (900s) for ieee=%016llX ep=%d (%d clusters)\n"),
                  (unsigned long long)ieee, ep, (int)(sizeof(common_clusters) / sizeof(common_clusters[0])));
 }
@@ -3000,33 +3496,17 @@ public:
         if (r == ESP_OK) {
             for (int i = 7; i >= 0; i--) ieee_addr = (ieee_addr << 8) | raw_ieee[i];
         }
-        DEBUG_PRINTF(F("[ZIGBEE-GW] Device announced: short=0x%04X ieee=0x%016llX (preregister)\n"),
+        DEBUG_PRINTF(F("[ZIGBEE-GW] Device announced: short=0x%04X ieee=0x%016llX (queued)\n"),
                      short_addr, (unsigned long long)ieee_addr);
 
-        if (ieee_addr) {
-            // Pre-register so the device is visible in /zd / /zg even if it
-            // never answers the immediate Basic Cluster query.
-            gw_add_responsive_device(short_addr, ieee_addr, 1);
-
-            // Genuine (re)join: the device is awake right now, so refresh the
-            // Basic Cluster retry budget (cleared by the per-report flood guard)
-            // and re-queue one query.  This is the only place the attempt cap is
-            // reset, which keeps sleepy Tuya devices from being flooded between
-            // announces while still re-interviewing a device that power-cycled.
-            ZigbeeDeviceInfo* joined = gw_find_discovered_device(ieee_addr);
-            if (joined && gw_device_needs_basic_info(*joined)) {
-                joined->basic_query_attempts = 0;
-                if (!gw_is_basic_query_queued(ieee_addr)) {
-                    gw_queue_basic_cluster_query(ieee_addr, short_addr, 1, 1000UL);
-                }
-            }
-        }
-
-        // Send Tuya DP query first (fast and lightweight, unblocks TS0601/GIEX immediately)
-        gw_tuya_send_dp_query(short_addr, 1);
-
-        // Note: Standard Basic Cluster query is queued with a safety delay inside gw_add_responsive_device(),
-        // so we don't need to send it synchronously here, which avoids flooding sleepy devices.
+        // All bookkeeping (pre-register, Basic Cluster budget, DP query) runs
+        // in the main loop; see gw_rx_drain(). Never touch shared state here.
+        GwRxEvent ev = {};
+        ev.kind = GW_RX_ANNOUNCE;
+        ev.short_addr = short_addr;
+        ev.endpoint = 1;
+        ev.ieee = ieee_addr;
+        gw_rx_push(ev);
     }
 
     // Override zbReadBasicCluster to handle Basic Cluster read responses ourselves.
@@ -3052,8 +3532,7 @@ public:
             uint16_t short_addr = esp_zb_address_short_by_ieee(ieee_le);
             esp_zb_lock_release();
             if (short_addr == 0xFFFF || short_addr == 0xFFFE) short_addr = 0;
-            gw_add_responsive_device(short_addr, gw_read_pending_ieee, 1);
-            gw_handleBasicClusterResponse(short_addr, attribute, gw_read_pending_ieee);
+            gw_rx_push_basic(gw_read_pending_ieee, short_addr, 1, attribute);
         }
         // Defer releasing the read slot to the next loop tick. A batch Basic
         // read arrives as several back-to-back zbReadBasicCluster() calls in the
@@ -3074,10 +3553,16 @@ public:
 
         gw_read_pending = false;
 
-        // Handle Basic Cluster responses (version, manufacturer, model strings)
-        // so that newly-discovered devices get a real label instead of "unknown".
-        // Must run BEFORE the generic sensor cache path which only handles
-        // numeric attribute reports.
+        // Resolve IEEE from short address (stack call, Zigbee context only).
+        uint64_t ieee_addr = 0;
+        esp_zb_ieee_addr_t raw_ieee;
+        if (esp_zb_ieee_address_by_short(src_address.u.short_addr, raw_ieee) == ESP_OK) {
+            ieee_addr = gw_ieee_from_raw(raw_ieee);
+        }
+
+        // Basic Cluster responses (version, manufacturer, model strings): copy
+        // the attribute payload; the discovered-device record is updated in the
+        // main loop.
         if (cluster_id == ZB_ZCL_CLUSTER_ID_BASIC &&
             (attribute->id == ZB_ZCL_ATTR_BASIC_APPLICATION_VERSION_ID ||
              attribute->id == ZB_ZCL_ATTR_BASIC_STACK_VERSION_ID ||
@@ -3086,71 +3571,25 @@ public:
              attribute->id == ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID ||
              attribute->id == ZB_ZCL_ATTR_BASIC_DATE_CODE_ID ||
              attribute->id == ZB_ZCL_ATTR_BASIC_SW_BUILD_ID)) {
-            // Ensure the device is present in the discovered list before we try
-            // to fill its manufacturer/model fields.
-            uint64_t basic_ieee = 0;
-            esp_zb_ieee_addr_t basic_raw;
-            if (esp_zb_ieee_address_by_short(src_address.u.short_addr, basic_raw) == ESP_OK) {
-                for (int i = 7; i >= 0; i--) basic_ieee = (basic_ieee << 8) | basic_raw[i];
-                if (basic_ieee) gw_add_responsive_device(src_address.u.short_addr, basic_ieee, src_endpoint);
-            }
-            gw_handleBasicClusterResponse(src_address.u.short_addr, attribute, basic_ieee);
+            gw_rx_push_basic(ieee_addr, src_address.u.short_addr, src_endpoint, attribute);
             return; // Don't treat the string as a sensor value
         }
 
-        // DEBUG_PRINTF(F("[ZIGBEE-GW] >>> zbAttributeRead: cluster=0x%04X attr=0x%04X type=0x%02X src_ep=%d src_short=0x%04X\n"),
-                    // cluster_id, attribute->id, attribute->data.type, src_endpoint, src_address.u.short_addr);
-        
-        // Resolve IEEE from short address and add as responsive device
-        uint64_t ieee_addr = 0;
-        esp_zb_ieee_addr_t raw_ieee;
-        if (esp_zb_ieee_address_by_short(src_address.u.short_addr, raw_ieee) == ESP_OK) {
-            for (int i = 7; i >= 0; i--) ieee_addr = (ieee_addr << 8) | raw_ieee[i];
-            if (ieee_addr) gw_add_responsive_device(src_address.u.short_addr, ieee_addr, src_endpoint);
-        }
-
-        int32_t value = extractAttributeValue(attribute);
-        
-        if (cluster_id == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF && attribute->id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
-            gw_station_status_process_standard_onoff(ieee_addr, src_endpoint, value != 0);
-        }
-
-        // DEBUG_PRINTF(F("[ZIGBEE-GW] >>> resolved ieee=%08lX%08lX value=%ld\n"),
-                    // (unsigned long)(ieee_addr >> 32), (unsigned long)(ieee_addr & 0xFFFFFFFF), value);
-        
-        if (gw_cache_attribute_report(ieee_addr, src_endpoint, cluster_id, attribute->id, value, 0)) {
-            DEBUG_PRINTF(F("[ZIGBEE-GW] ✓ Report CACHED [%d/%d]: IEEE=%08lX%08lX cluster=0x%04X attr=0x%04X value=%ld ep=%d\n"),
-                        (int)pending_report_count, (int)MAX_PENDING_REPORTS,
-                        (unsigned long)(ieee_addr >> 32), (unsigned long)(ieee_addr & 0xFFFFFFFF),
-                        cluster_id, attribute->id, value, src_endpoint);
-        }
+        GwRxEvent ev = {};
+        ev.kind = GW_RX_ATTR;
+        ev.short_addr = src_address.u.short_addr;
+        ev.endpoint = src_endpoint;
+        ev.ieee = ieee_addr;
+        ev.cluster_id = cluster_id;
+        ev.attr_id = attribute->id;
+        ev.value = extractAttributeValue(attribute);
+        ev.lqi = 0;
+        gw_rx_push(ev);
     }
 
 private:
     int32_t extractAttributeValue(const esp_zb_zcl_attribute_t *attr) {
-        if (!attr || !attr->data.value) return 0;
-        switch (attr->data.type) {
-            case ESP_ZB_ZCL_ATTR_TYPE_S8:  return (int32_t)(*(int8_t*)attr->data.value);
-            case ESP_ZB_ZCL_ATTR_TYPE_S16: return (int32_t)(*(int16_t*)attr->data.value);
-            case ESP_ZB_ZCL_ATTR_TYPE_S32: return *(int32_t*)attr->data.value;
-            case ESP_ZB_ZCL_ATTR_TYPE_U8:  return (int32_t)(*(uint8_t*)attr->data.value);
-            case ESP_ZB_ZCL_ATTR_TYPE_U16: return (int32_t)(*(uint16_t*)attr->data.value);
-            case ESP_ZB_ZCL_ATTR_TYPE_U32: return (int32_t)(*(uint32_t*)attr->data.value);
-            case 0x24:  // uint40
-            case 0x25: { // uint48
-                uint8_t len = (attr->data.type == 0x24) ? 5 : 6;
-                const uint8_t* raw = (const uint8_t*)attr->data.value;
-                uint32_t value = 0;
-                for (uint8_t i = 0; i < len && i < 4; i++) {
-                    value |= ((uint32_t)raw[i]) << (8 * i);
-                }
-                if (value > 0x7FFFFFFFUL) value = 0x7FFFFFFFUL;
-                return (int32_t)value;
-            }
-            default:
-                // DEBUG_PRINTF(F("[ZIGBEE-GW] Unknown attribute type: 0x%02X\n"), attr->data.type);
-                return 0;
-        }
+        return zigbee_extract_attribute_value(attr);
     }
 };
 
@@ -3176,7 +3615,7 @@ static void gw_updateSensorFromReport(ZigbeeSensor* zb_sensor, const ZigbeeAttri
              (zb_sensor->tuya_dp_battery >= 0 && raw_attr == (uint16_t)zb_sensor->tuya_dp_battery));
         if (is_battery_report) {
             uint32_t batt_pct = zigbee_battery_percent_from_report(is_tuya_report, raw_attr, tuya_report_type(report.attr_id), zb_sensor->tuya_dp_battery, report.value);
-            zb_sensor->last_battery = batt_pct;
+            if (batt_pct != ZB_BATTERY_UNKNOWN) zb_sensor->last_battery = batt_pct;
             zb_sensor->last_lqi     = report.lqi;
             // Intentionally do NOT touch last_data / last_native_data /
             // flags.data_ok / last_read / last / comm_mode — those belong
@@ -3620,6 +4059,11 @@ static void gw_schedule_configure_reporting_all(unsigned long initial_delay_ms =
         zb->report_interval_s = max_interval;
         delay_ms += 1000;
         count++;
+
+        // No battery setup here: right after (re)connect the sleepy devices are
+        // not polling, the attempt would be lost and would burn the hourly
+        // battery budget.  gw_schedule_configure_reporting_for_ieee() queues it
+        // on the device's first frame instead (see gw_add_responsive_device).
     }
     if (count > 0) {
         // DEBUG_PRINTF("[ZIGBEE-GW] Scheduled configure reporting for %d sensor(s)\n", count);
@@ -3640,7 +4084,26 @@ void sensor_zigbee_gw_stop() {
     // DEBUG_PRINTLN(F("[ZIGBEE-GW] stop() called — Zigbee stays active (permanent mode)"));
 }
 
+#if defined(ESP32) && defined(BOARD_HAS_PSRAM)
+extern "C" char _ext_ram_bss_start[];
+extern "C" char _ext_ram_bss_end[];
+#endif
+
 void sensor_zigbee_gw_start() {
+    // The station control tables live in PSRAM .bss.  Zero them explicitly:
+    // on this build uninitialised entries were observed (active=1 with garbage
+    // fields) and would raise "switch failed" alerts for non-Zigbee stations.
+    memset(zb_station_ctl, 0, sizeof(zb_station_ctl));
+    memset(zb_station_switch_error, 0, sizeof(zb_station_switch_error));
+    memset(zb_station_switch_waiting, 0, sizeof(zb_station_switch_waiting));
+    memset(zb_station_physical_on, 0, sizeof(zb_station_physical_on));
+    memset(gw_zcl_timed_off_unsupported, 0, sizeof(gw_zcl_timed_off_unsupported));
+#if defined(ESP32) && defined(BOARD_HAS_PSRAM)
+    DEBUG_PRINTF(F("[ZIGBEE-GW] ext_ram_bss=%p..%p zb_station_ctl=%p (%u B) %s\n"),
+                 (void*)_ext_ram_bss_start, (void*)_ext_ram_bss_end, (void*)zb_station_ctl,
+                 (unsigned)sizeof(zb_station_ctl),
+                 ((char*)zb_station_ctl >= _ext_ram_bss_start && (char*)zb_station_ctl < _ext_ram_bss_end) ? "inside" : "OUTSIDE ext_ram_bss!");
+#endif
     // NOT POSSIBLE / NOT SENSIBLE over WiFi: a Zigbee Gateway (coordinator) must
     // keep its 802.15.4 receiver on continuously, but the ESP32-C5 shares ONE
     // 2.4 GHz radio between WiFi and 802.15.4. With no Ethernet the coordinator
@@ -3775,10 +4238,19 @@ void sensor_zigbee_gw_start() {
     // ZBOSS queue exhaustion panics (like zb_bufpool_mult_storage.c:105 assertions).
     esp_zb_io_buffer_size_set(80);
     esp_zb_scheduler_queue_size_set(80);
-    // Keep commissioning in standard mode. Install-code link-key exchange has
-    // triggered child-auth asserts with mixed device fleets on ESP32-C5.
+    // Zigbee 3.0: require joining devices to replace the well-known
+    // "ZigBeeAlliance09" trust-center link key with a unique one. Devices that
+    // never complete the TCLK update are removed by the stack after the BDB
+    // timeout instead of staying on the network with the global key.
+    // Build with -D ZIGBEE_ALLOW_WELLKNOWN_TCLK to restore the legacy behaviour
+    // for fleets that trigger child-auth asserts on ESP32-C5.
+#if defined(ZIGBEE_ALLOW_WELLKNOWN_TCLK)
     esp_zb_secur_link_key_exchange_required_set(false);
+#else
+    esp_zb_secur_link_key_exchange_required_set(true);
+#endif
 
+    gw_rx_ensure_queue();
     DEBUG_PRINTLN(F("[ZIGBEE-GW] Starting as COORDINATOR..."));
     if (!Zigbee.begin(ZIGBEE_COORDINATOR)) {
         DEBUG_PRINTLN(F("[ZIGBEE-GW] ERROR: Zigbee.begin(COORDINATOR) FAILED!"));
@@ -3801,6 +4273,29 @@ void sensor_zigbee_gw_start() {
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     Zigbee.onGlobalDefaultResponse(gw_zigbee_default_response_cb);
+
+    // Unicasts to sleepy end devices sit in the coordinator's indirect queue
+    // until the child polls.  The 802.15.4 default (macTransactionPersistenceTime
+    // = 7.68 s) is shorter than the poll period of many battery sensors (e.g.
+    // Third Reality soil sensors do not poll after a report), so Bind /
+    // ConfigureReporting / Read requests were dropped before the device ever
+    // asked for them.  Keep them for GW_MAC_PERSISTENCE_S instead.
+    {
+        esp_zb_lock_acquire(portMAX_DELAY);
+        esp_err_t kerr = esp_zb_nwk_set_keepalive_mode(GW_KEEPALIVE_MODE);
+        esp_err_t terr = esp_zb_nwk_set_ed_timeout(GW_ED_TIMEOUT);
+        esp_zb_lock_release();
+        DEBUG_PRINTF(F("[ZIGBEE-GW] Keepalive mode=%d (err=%d), default ED timeout=%d (err=%d)\n"),
+                     (int)GW_KEEPALIVE_MODE, (int)kerr, (int)GW_ED_TIMEOUT, (int)terr);
+    }
+    if (GW_MAC_PERSISTENCE_S > 0) {
+        esp_zb_lock_acquire(portMAX_DELAY);
+        esp_err_t perr = esp_zb_mac_set_transaction_persistence_time((uint32_t)GW_MAC_PERSISTENCE_S * 1000000UL);
+        uint32_t pnow = esp_zb_mac_get_transaction_persistence_time();
+        esp_zb_lock_release();
+        DEBUG_PRINTF(F("[ZIGBEE-GW] MAC transaction persistence set to %u s (err=%d, readback=%lu us)\n"),
+                     (unsigned)GW_MAC_PERSISTENCE_S, (int)perr, (unsigned long)pnow);
+    }
     // DEBUG_PRINTLN(F("[ZIGBEE-GW] Zigbee Coordinator started successfully!"));
     // DEBUG_PRINTF("[ZIGBEE-GW] Zigbee.started()=%d, Zigbee.connected()=%d\n",
                 // Zigbee.started() ? 1 : 0, Zigbee.connected() ? 1 : 0);
@@ -3809,6 +4304,8 @@ void sensor_zigbee_gw_start() {
     // This intercepts raw Tuya frames before ZCL processing and converts them
     // into standard report-cache entries for sensors like GIEX GX-04.
     esp_zb_aps_data_indication_handler_register(gw_tuya_aps_indication_handler);
+    // APS confirm for every ZCL command we send (station switch verification).
+    esp_zb_zcl_command_send_status_handler_register(gw_send_status_cb);
     // DEBUG_PRINTLN(F("[ZIGBEE-GW] Tuya APS indication handler registered"));
 
     // DEBUG_PRINTF(F("[ZIGBEE-GW] Heap AFTER init: internal free=%u, largest=%u, PSRAM free=%u, largest=%u\n"),
@@ -3960,6 +4457,12 @@ void sensor_zigbee_gw_process_reports(uint64_t ieee_addr, uint8_t endpoint,
             bool is_tuya_report = (report.attr_id & TUYA_REPORT_FLAG_PRESCALED) != 0;
             uint16_t raw_attr = zigbee_report_attr_id(report.attr_id);
             uint32_t batt_pct = zigbee_battery_percent_from_report(is_tuya_report, raw_attr, tuya_report_type(report.attr_id), configured_battery_dp, report.value);
+            if (batt_pct == ZB_BATTERY_UNKNOWN) {
+                DEBUG_PRINTF(F("[ZIGBEE-GW] Battery report ignored (raw=%ld = unknown) ieee=%016llX\n"),
+                             (long)report.value, (unsigned long long)report.ieee_addr);
+                report.consumed = true;
+                continue;
+            }
             
             // Try to find the device in gw_discovered_devices and update its battery level and LQI
             ZigbeeDeviceInfo* dev = gw_find_discovered_device(report.ieee_addr);
@@ -4193,7 +4696,7 @@ void sensor_zigbee_gw_process_reports(uint64_t ieee_addr, uint8_t endpoint,
                 while ((s2 = sensors_iterate_next(it2)) != NULL) {
                     if (s2 && s2->type == SENSOR_ZIGBEE) {
                         ZigbeeSensor* zb2 = static_cast<ZigbeeSensor*>(s2);
-                        if (zb2->device_ieee == report.ieee_addr) {
+                        if (zb2->device_ieee == report.ieee_addr && battery_pct != ZB_BATTERY_UNKNOWN) {
                             zb2->last_battery = battery_pct;
                         }
                     }
@@ -4467,16 +4970,11 @@ int sensor_zigbee_gw_clear_device_runtime_state(uint64_t device_ieee) {
 
     int cleared_verify = 0;
 
-    if (gw_pending_switch.valid && gw_pending_switch.ieee_addr == device_ieee) {
-        gw_pending_switch.valid = false;
-        gw_pending_switch.attempts = 0;
-    }
-
-    for (int i = 0; i < ZB_VERIFY_MAX; i++) {
-        if (!zb_verify_table[i].pending) continue;
-        if (zb_verify_table[i].ieee != device_ieee) continue;
-        gw_station_switch_waiting_set(zb_verify_table[i].sid, false);
-        zb_verify_table[i].pending = false;
+    for (uint8_t sid = 0; sid < MAX_NUM_STATIONS; sid++) {
+        ZbStationCtl &e = zb_station_ctl[sid];
+        if (!e.active || e.ieee != device_ieee) continue;
+        gw_station_switch_waiting_set(sid, false);
+        e.active = false;
         cleared_verify++;
     }
 
@@ -4862,6 +5360,20 @@ static void sensor_zigbee_gw_do_lookups() {
                     strncpy(logdev.unit, unit_str, sizeof(logdev.unit) - 1);
                     logdev.unitid = s["unitid"] | 0;
 
+                    // Runtime role (see runtime_roles.php in the device DB)
+                    const char* role_str = s["role"] | "";
+                    if (strcmp(role_str, "runtime") == 0)   logdev.role = ZB_LD_ROLE_RUNTIME;
+                    else if (strcmp(role_str, "mode") == 0) logdev.role = ZB_LD_ROLE_MODE;
+                    else                                     logdev.role = ZB_LD_ROLE_NONE;
+                    logdev.channel = s["channel"] | 0;
+                    const char* rt_unit = s["runtime_unit"] | "";
+                    if (strcmp(rt_unit, "min") == 0)    logdev.runtime_unit = ZB_RT_UNIT_MIN;
+                    else if (strcmp(rt_unit, "h") == 0) logdev.runtime_unit = ZB_RT_UNIT_H;
+                    else                                logdev.runtime_unit = ZB_RT_UNIT_S;
+                    logdev.runtime_max  = s["runtime_max"] | 0;
+                    logdev.prereq_dp    = s["prereq_dp"] | 0;
+                    logdev.prereq_value = s["prereq_value"] | 0;
+
                     // Register it!
                     OpenSprinkler::zigbee_logical_register(logdev);
                 }
@@ -5015,6 +5527,7 @@ static void gw_wake_unidentified_devices() {
         ZigbeeDeviceInfo& dev = gw_discovered_devices[idx];
         if (dev.ieee_addr == 0) continue;
         if (!gw_device_needs_basic_info(dev)) continue;  // already identified
+        if (gw_station_ctl_pending_for(dev.ieee_addr)) continue;  // station command first
         // Skip devices that reported recently — the report path re-queries them.
         if (dev.last_rx_at_ms != 0 && now - dev.last_rx_at_ms < GW_WAKE_UNIDENTIFIED_INTERVAL_MS) continue;
         uint16_t sa = dev.short_addr;
@@ -5029,8 +5542,155 @@ static void gw_wake_unidentified_devices() {
     s_last_wake_ms = now;  // nothing to wake this round
 }
 
+// Send-status callback (Zigbee task): queue the APS confirm for the station
+// switch state machine.
+static void gw_send_status_cb(esp_zb_zcl_command_send_status_message_t msg) {
+    GwRxEvent ev = {};
+    ev.kind = GW_RX_SEND_STATUS;
+    ev.tsn = msg.tsn;
+    ev.status = (int32_t)msg.status;
+    ev.endpoint = msg.dst_endpoint;
+    ev.short_addr = (msg.dst_addr.addr_type == ESP_ZB_ZCL_ADDR_TYPE_SHORT) ? msg.dst_addr.u.short_addr : 0xFFFF;
+    gw_rx_push(ev);
+}
+
+static void gw_station_ctl_on_send_status(uint8_t tsn, int32_t status, uint16_t short_addr);
+static void gw_station_ctl_on_timed_off_rejected(uint64_t ieee);
+
+// Drain the RX queue in the main loop and run all application-level work that
+// used to live in the Zigbee callbacks.
+static void gw_rx_drain() {
+    if (!gw_rx_queue) return;
+    GwRxEvent ev;
+    uint64_t last_rx_ieee = 0;
+    int processed = 0;
+    while (processed < 64 && xQueueReceive(gw_rx_queue, &ev, 0) == pdTRUE) {
+        processed++;
+        switch (ev.kind) {
+            case GW_RX_SEEN:
+                if (ev.ieee) gw_add_responsive_device(ev.short_addr, ev.ieee, ev.endpoint);
+                break;
+
+            case GW_RX_ANNOUNCE:
+                if (ev.ieee) {
+                    // Pre-register so the device is visible in /zd / /zg even if
+                    // it never answers the immediate Basic Cluster query.
+                    gw_add_responsive_device(ev.short_addr, ev.ieee, 1);
+                    // Genuine (re)join: refresh the Basic Cluster retry budget
+                    // (this is the only place the attempt cap is reset) and
+                    // re-queue one query.
+                    ZigbeeDeviceInfo* joined = gw_find_discovered_device(ev.ieee);
+                    if (joined && gw_device_needs_basic_info(*joined)) {
+                        joined->basic_query_attempts = 0;
+                        if (!gw_is_basic_query_queued(ev.ieee)) {
+                            gw_queue_basic_cluster_query(ev.ieee, ev.short_addr, 1, 1000UL);
+                        }
+                    }
+                    // A (re)joined device may have lost its bindings/reporting
+                    // configuration: re-schedule it for all sensors on this IEEE.
+                    gw_schedule_configure_reporting_for_ieee(ev.ieee, 8000UL, true);
+                }
+                // Tuya DP query first (fast, unblocks TS0601/GIEX immediately).
+                gw_tuya_send_dp_query(ev.short_addr, 1);
+                break;
+
+            case GW_RX_ATTR:
+                if (ev.ieee) gw_add_responsive_device(ev.short_addr, ev.ieee, ev.endpoint);
+                if (ev.cluster_id == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF && ev.attr_id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
+                    gw_station_status_process_standard_onoff(ev.ieee, ev.endpoint, ev.value != 0);
+                }
+                if (gw_cache_attribute_report(ev.ieee, ev.endpoint, ev.cluster_id, ev.attr_id, ev.value, ev.lqi)) {
+                    ZB_GW_TRACE(F("[ZIGBEE-GW] Report cached [%d/%d]: ieee=%016llX cluster=0x%04X attr=0x%04X value=%ld ep=%d\n"),
+                                (int)pending_report_count, (int)MAX_PENDING_REPORTS,
+                                (unsigned long long)ev.ieee, ev.cluster_id, ev.attr_id, (long)ev.value, ev.endpoint);
+                }
+                break;
+
+            case GW_RX_TUYA_DP:
+                if (ev.ieee) {
+                    gw_add_responsive_device(ev.short_addr, ev.ieee, ev.endpoint);
+                    gw_mark_tuya_device(ev.ieee);
+                }
+                gw_cache_tuya_dp_report(ev.ieee, ev.endpoint, (uint8_t)ev.attr_id, ev.value, ev.lqi, ev.dp_type);
+                break;
+
+            case GW_RX_BASIC: {
+                if (ev.ieee && ev.short_addr != 0) gw_add_responsive_device(ev.short_addr, ev.ieee, ev.endpoint);
+                esp_zb_zcl_attribute_t attr = {};
+                attr.id = ev.attr_id;
+                attr.data.type = (esp_zb_zcl_attr_type_t)ev.dp_type;
+                attr.data.size = ev.raw_len;
+                attr.data.value = ev.raw;
+                gw_handleBasicClusterResponse(ev.short_addr, &attr, ev.ieee);
+                break;
+            }
+
+            case GW_RX_SEND_STATUS:
+                gw_station_ctl_on_send_status(ev.tsn, ev.status, ev.short_addr);
+                continue; // no device RX
+
+            case GW_RX_DEFAULT_RESP:
+                DEBUG_PRINTF(F("[ZIGBEE-GW][ZCL] Default response: cluster=0x%04X ep=%u status=0x%02X\n"),
+                             ev.cluster_id, ev.endpoint, (unsigned)ev.status);
+                // A device that does not implement OnWithTimedOff answers with
+                // UNSUP_CLUSTER_COMMAND: remember it and re-issue a plain On.
+                if (ev.cluster_id == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
+                    ev.status == (int32_t)ESP_ZB_ZCL_STATUS_UNSUP_CLUST_CMD &&
+                    gw_last_timed_off_ieee != 0 && (millis() - gw_last_timed_off_ms) < 3000UL) {
+                    gw_zcl_timed_off_mark_unsupported(gw_last_timed_off_ieee);
+                    gw_station_ctl_on_timed_off_rejected(gw_last_timed_off_ieee);
+                }
+                continue; // no device RX
+
+            default:
+                break;
+        }
+        // Wake trigger: the device just talked to us, so it is listening now.
+        if (ev.ieee && ev.ieee != last_rx_ieee) {
+            last_rx_ieee = ev.ieee;
+            gw_station_ctl_on_device_rx(ev.ieee);
+        }
+    }
+    static uint32_t s_last_drop_report = 0;
+    if (gw_rx_dropped != s_last_drop_report) {
+        DEBUG_PRINTF(F("[ZIGBEE-GW] RX queue overflow: %lu events dropped so far\n"), (unsigned long)gw_rx_dropped);
+        s_last_drop_report = gw_rx_dropped;
+    }
+}
+
+// Pull RSSI / LQI of every child out of the stack's neighbor table into the
+// discovered-device records (shown in the UI as a signal-quality lamp).  The
+// neighbor RSSI is the level at which the coordinator last heard the child;
+// sleepy children rarely carry a usable LQI there, so LQI is only taken when
+// non-zero.  In debug builds the full table is dumped as well (device type,
+// rx-on-when-idle, end-device timeout and aging countdown, which resets on
+// every poll of the child).
+static void gw_refresh_link_quality() {
+    if (!gw_zigbee_initialized || !Zigbee.started() || !Zigbee.connected()) return;
+    esp_zb_nwk_info_iterator_t nit = ESP_ZB_NWK_INFO_ITERATOR_INIT;
+    esp_zb_nwk_neighbor_info_t nb;
+    bool changed = false;
+    esp_zb_lock_acquire(portMAX_DELAY);
+    while (esp_zb_nwk_get_next_neighbor(&nit, &nb) == ESP_OK) {
+        uint64_t ieee = gw_ieee_from_raw(nb.ieee_addr);
+        DEBUG_PRINTF(F("[ZIGBEE-GW][NBR] short=0x%04X ieee=%016llX type=%u rxidle=%u rel=%u lqi=%u rssi=%d edto=%lus age=%lums\n"),
+                     nb.short_addr, (unsigned long long)ieee,
+                     (unsigned)nb.device_type, (unsigned)nb.rx_on_when_idle, (unsigned)nb.relationship,
+                     (unsigned)nb.lqi, (int)nb.rssi, (unsigned long)nb.device_timeout, (unsigned long)nb.timeout_counter);
+        ZigbeeDeviceInfo* dev = gw_find_discovered_device(ieee);
+        if (!dev) continue;
+        if (nb.rssi != 127 && nb.rssi != 0 && dev->rssi != nb.rssi) { dev->rssi = nb.rssi; changed = true; }
+        if (nb.lqi != 0 && dev->lqi != nb.lqi) { dev->lqi = nb.lqi; changed = true; }
+    }
+    esp_zb_lock_release();
+    if (changed) gw_mark_discovered_devices_dirty();
+}
+
 void sensor_zigbee_gw_loop() {
     if (!gw_zigbee_initialized) return;
+
+    // Hand-off from the Zigbee task: run all callback follow-up work here.
+    gw_rx_drain();
 
     // Service the WiFi-off join state machine first (WiFi may be down).
     gw_wifi_off_join_service();
@@ -5194,40 +5854,6 @@ void sensor_zigbee_gw_loop() {
         }
     }
 
-    // Retry one deferred station command if it was queued while Zigbee was not
-    // connected (or short address was not yet known during startup/rejoin).
-    if (connected && gw_pending_switch.valid && millis() >= gw_pending_switch.next_try_ms) {
-        bool ok = false;
-        if (gw_pending_switch.use_tuya) {
-            ok = sensor_zigbee_send_tuya_dp_write(gw_pending_switch.ieee_addr,
-                                                  gw_pending_switch.endpoint,
-                                                  gw_pending_switch.dp_id,
-                                                  gw_pending_switch.turnon);
-        } else {
-            ok = sensor_zigbee_send_on_off(gw_pending_switch.ieee_addr,
-                                           gw_pending_switch.endpoint,
-                                           gw_pending_switch.turnon);
-        }
-        if (ok) {
-            DEBUG_PRINTF(F("[ZIGBEE-GW] Deferred command delivered: ieee=%016llX ep=%d state=%d\n"),
-                         (unsigned long long)gw_pending_switch.ieee_addr,
-                         gw_pending_switch.endpoint,
-                         gw_pending_switch.turnon ? 1 : 0);
-            gw_pending_switch.valid = false;
-            gw_pending_switch.attempts = 0;
-        } else {
-            if (gw_pending_switch.attempts >= 30) {
-                DEBUG_PRINTF(F("[ZIGBEE-GW] Deferred command dropped after %d attempts: ieee=%016llX\n"),
-                             gw_pending_switch.attempts,
-                             (unsigned long long)gw_pending_switch.ieee_addr);
-                gw_pending_switch.valid = false;
-                gw_pending_switch.attempts = 0;
-            } else {
-                gw_pending_switch.next_try_ms = millis() + 1000UL;
-            }
-        }
-    }
-
     // NOTE: No idle timeout - Arduino Zigbee library does NOT support
     // Zigbee.stop() + Zigbee.begin() restart (causes Load access fault).
     // Once started, Zigbee stays running until reboot.
@@ -5345,9 +5971,15 @@ void sensor_zigbee_gw_loop() {
         }
     }
 
+    // Initial battery read after bind/configure-reporting (one per tick)
+    if (connected) {
+        gw_process_battery_read_queue();
+    }
+
     static unsigned long last_status_print = 0;
     if (millis() - last_status_print > 60000) {
         last_status_print = millis();
+        gw_refresh_link_quality();
         // DEBUG_PRINTF("[ZIGBEE-GW] Status: started=%d connected=%d devices=%d pending_reports=%d\n",
                     // Zigbee.started() ? 1 : 0, Zigbee.connected() ? 1 : 0,
                     // (int)gw_discovered_devices.size(), (int)pending_report_count);
@@ -5385,7 +6017,7 @@ void sensor_zigbee_gw_loop() {
     }
 }
 
-bool sensor_zigbee_send_on_off(uint64_t device_ieee, uint8_t endpoint, bool turnon) {
+bool sensor_zigbee_send_on_off(uint64_t device_ieee, uint8_t endpoint, bool turnon, bool urgent, uint16_t on_time_s) {
     if (!gw_zigbee_initialized || !Zigbee.started() || !Zigbee.connected()) {
         if (gw_zigbee_initialized) {
             DEBUG_PRINTLN(F("[ZIGBEE-GW] Standard On/Off command failed: Zigbee not initialized or not connected"));
@@ -5413,40 +6045,60 @@ bool sensor_zigbee_send_on_off(uint64_t device_ieee, uint8_t endpoint, bool turn
         return false;
     }
 
-    if (!gw_is_device_access_allowed(device_ieee, short_addr, true, 5000UL)) {
-        DEBUG_PRINTF(F("[ZIGBEE-GW] Standard On/Off rate-limited/cooldown (5s) for ieee=%016llX. Deferring.\n"),
+    if (!urgent && !gw_is_device_access_allowed(device_ieee, short_addr, true, 5000UL)) {
+        DEBUG_PRINTF(F("[ZIGBEE-GW] Standard On/Off rate-limited (5s) for ieee=%016llX; station state machine retries.\n"),
                      (unsigned long long)device_ieee);
-        if (!gw_pending_switch.valid || gw_pending_switch.ieee_addr != device_ieee) {
-            gw_queue_pending_switch(false, device_ieee, endpoint, 1, turnon);
-        }
         return false;
     }
 
-    esp_zb_zcl_on_off_cmd_t req = {};
-    req.zcl_basic_cmd.dst_addr_u.addr_short = short_addr;
-    req.zcl_basic_cmd.dst_endpoint = endpoint;
-    req.zcl_basic_cmd.src_endpoint = 10;
-    req.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-    req.on_off_cmd_id = turnon ? ESP_ZB_ZCL_CMD_ON_OFF_ON_ID : ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID;
+    uint8_t tsn;
+    if (turnon && on_time_s > 0 && !gw_zcl_timed_off_is_unsupported(device_ieee)) {
+        // OnWithTimedOff (ZCL On/Off 0x42): the device switches itself off after
+        // on_time (1/10 s, max 6553.5 s). Longer runs are refreshed by the
+        // periodic special-station refresh with the remaining time.
+        uint32_t tenths = (uint32_t)on_time_s * 10UL;
+        if (tenths > 0xFFFEUL) tenths = 0xFFFEUL;
+        esp_zb_zcl_on_off_on_with_timed_off_cmd_t req = {};
+        req.zcl_basic_cmd.dst_addr_u.addr_short = short_addr;
+        req.zcl_basic_cmd.dst_endpoint = endpoint;
+        req.zcl_basic_cmd.src_endpoint = 10;
+        req.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+        req.on_off_control = 0;
+        req.on_time = (uint16_t)tenths;
+        req.off_wait_time = 0;
+        DEBUG_PRINTF(F("[ZIGBEE-GW] Sending OnWithTimedOff -> short_addr=0x%04X ep=%d on_time=%us\n"),
+                     short_addr, endpoint, (unsigned)on_time_s);
+        esp_zb_lock_acquire(portMAX_DELAY);
+        tsn = esp_zb_zcl_on_off_on_with_timed_off_cmd_req(&req);
+        esp_zb_lock_release();
+        gw_last_timed_off_ieee = device_ieee;
+        gw_last_timed_off_ms = millis();
+    } else {
+        esp_zb_zcl_on_off_cmd_t req = {};
+        req.zcl_basic_cmd.dst_addr_u.addr_short = short_addr;
+        req.zcl_basic_cmd.dst_endpoint = endpoint;
+        req.zcl_basic_cmd.src_endpoint = 10;
+        req.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+        req.on_off_cmd_id = turnon ? ESP_ZB_ZCL_CMD_ON_OFF_ON_ID : ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID;
 
-    DEBUG_PRINTF(F("[ZIGBEE-GW] Sending On/Off command -> short_addr=0x%04X ep=%d state=%d\n"),
-                 short_addr, endpoint, turnon);
+        DEBUG_PRINTF(F("[ZIGBEE-GW] Sending On/Off command -> short_addr=0x%04X ep=%d state=%d\n"),
+                     short_addr, endpoint, turnon);
 
-    esp_zb_lock_acquire(portMAX_DELAY);
-    esp_zb_zcl_on_off_cmd_req(&req);
-    esp_zb_lock_release();
+        esp_zb_lock_acquire(portMAX_DELAY);
+        tsn = esp_zb_zcl_on_off_cmd_req(&req);
+        esp_zb_lock_release();
+    }
+    gw_station_ctl_note_sent(gw_ctl_sending_sid, tsn);
 
     gw_record_device_access(device_ieee, short_addr, true);
     return true;
 }
 
-static bool gw_resolve_tuya_short_addr(uint64_t* device_ieee, uint16_t* short_addr, const char* context,
-                                       bool queue_on_unavailable, uint8_t endpoint, uint8_t dp_id, bool turnon) {
+static bool gw_resolve_tuya_short_addr(uint64_t* device_ieee, uint16_t* short_addr, const char* context) {
     if (!gw_zigbee_initialized || !Zigbee.started() || !Zigbee.connected()) {
         if (gw_zigbee_initialized) {
             DEBUG_PRINTF(F("[ZIGBEE-GW] %s failed: Zigbee not initialized or not connected\n"), context);
         }
-        if (queue_on_unavailable && device_ieee) gw_queue_pending_switch(true, *device_ieee, endpoint, dp_id, turnon);
         return false;
     }
     if (!device_ieee || *device_ieee == 0 || !short_addr) return false;
@@ -5455,14 +6107,9 @@ static bool gw_resolve_tuya_short_addr(uint64_t* device_ieee, uint16_t* short_ad
     // attempting short-address lookup.
     gw_try_fix_ieee(device_ieee);
 
-    esp_zb_ieee_addr_t ieee_le = {0};
-    for (int i = 0; i < 8; i++) {
-        ieee_le[i] = (uint8_t)(*device_ieee >> (i * 8));
-    }
-
-    esp_zb_lock_acquire(portMAX_DELAY);
-    *short_addr = esp_zb_address_short_by_ieee(ieee_le);
-    esp_zb_lock_release();
+    // Persisted device cache first (survives a reboot, the ZBOSS address table
+    // may not resolve a sleepy device until it talks to us), then the stack.
+    *short_addr = gw_get_short_addr(*device_ieee);
 
     if (*short_addr == 0xFFFF || *short_addr == 0xFFFE) {
         // Distinguish a transient lookup miss (device paired but short addr
@@ -5477,9 +6124,16 @@ static bool gw_resolve_tuya_short_addr(uint64_t* device_ieee, uint16_t* short_ad
             }
             return false;
         }
-        DEBUG_PRINTF(F("[ZIGBEE-GW] %s failed: short addr unknown for ieee=%016llX\n"),
-                    context, (unsigned long long)*device_ieee);
-        if (queue_on_unavailable) gw_queue_pending_switch(true, *device_ieee, endpoint, dp_id, turnon);
+        // Throttled: the station state machine retries with backoff and would
+        // otherwise repeat this line every few seconds per station.
+        static uint64_t s_last_unknown_ieee = 0;
+        static uint32_t s_last_unknown_ms = 0;
+        if (*device_ieee != s_last_unknown_ieee || (millis() - s_last_unknown_ms) > 60000UL) {
+            s_last_unknown_ieee = *device_ieee;
+            s_last_unknown_ms = millis();
+            DEBUG_PRINTF(F("[ZIGBEE-GW] %s deferred: short addr unknown for ieee=%016llX (retrying with backoff)\n"),
+                        context, (unsigned long long)*device_ieee);
+        }
         return false;
     }
 
@@ -5488,17 +6142,16 @@ static bool gw_resolve_tuya_short_addr(uint64_t* device_ieee, uint16_t* short_ad
 
 static bool gw_send_tuya_dp_raw_cmd(uint64_t device_ieee, uint8_t endpoint, uint8_t dp_id, uint8_t dp_type,
                                     const uint8_t* value, uint16_t value_len, uint8_t command_id,
-                                    bool queue_on_unavailable, bool queued_turnon) {
+                                    bool urgent) {
     uint16_t short_addr = 0;
-    if (!gw_resolve_tuya_short_addr(&device_ieee, &short_addr, "Tuya DP write",
-                                    queue_on_unavailable, endpoint, dp_id, queued_turnon)) {
+    if (!gw_resolve_tuya_short_addr(&device_ieee, &short_addr, "Tuya DP write")) {
         return false;
     }
 
     // Prepare a generic Tuya dataRequest payload. This is the same logical
     // shape used by Zigbee2MQTT's sendDataPoint* helpers and works for valves,
     // switches, lights, and other Tuya MCU devices once their DP map is known.
-    uint8_t payload[20];
+    uint8_t payload[32];
     uint16_t tuya_seq = gw_next_tuya_seq();
     size_t payload_len = gw_build_tuya_dp_payload(payload, sizeof(payload),
                                                   tuya_seq, dp_id, dp_type,
@@ -5516,19 +6169,58 @@ static bool gw_send_tuya_dp_raw_cmd(uint64_t device_ieee, uint8_t endpoint, uint
                  payload[4], payload[5], payload[6], payload_len > 7 ? " ..." : "");
 
     return gw_schedule_tuya_dp_cmd(short_addr, endpoint, command_id, dp_id, dp_type,
-                                   payload, payload_len, tuya_seq);
+                                   payload, payload_len, tuya_seq, urgent);
+}
+
+// Send several datapoints in ONE Tuya dataRequest frame (what zigbee2mqtt's
+// sendDataPoints does). One frame = one radio transaction, so mode, runtime
+// and switch state reach a sleepy valve together instead of colliding as
+// separate commands.
+static bool gw_send_tuya_dp_records(uint64_t device_ieee, uint8_t endpoint,
+                                    const GwTuyaDpRecord* recs, uint8_t n_recs, bool urgent) {
+    if (!recs || n_recs == 0) return false;
+    uint16_t short_addr = 0;
+    if (!gw_resolve_tuya_short_addr(&device_ieee, &short_addr, "Tuya DP multi-write")) return false;
+
+    uint8_t payload[32];
+    uint16_t tuya_seq = gw_next_tuya_seq();
+    size_t len = 0;
+    payload[len++] = (uint8_t)(tuya_seq >> 8);
+    payload[len++] = (uint8_t)(tuya_seq & 0xFF);
+    for (uint8_t i = 0; i < n_recs; i++) {
+        const GwTuyaDpRecord& r = recs[i];
+        if (r.len != 1 && r.len != 4) return false;
+        if (len + 4U + r.len > sizeof(payload)) {
+            DEBUG_PRINTLN(F("[ZIGBEE-GW] Tuya multi-DP frame too large"));
+            return false;
+        }
+        payload[len++] = r.dp_id;
+        payload[len++] = r.dp_type;
+        payload[len++] = 0;
+        payload[len++] = r.len;
+        if (r.len == 4) {
+            payload[len++] = (uint8_t)(r.value >> 24);
+            payload[len++] = (uint8_t)(r.value >> 16);
+            payload[len++] = (uint8_t)(r.value >> 8);
+        }
+        payload[len++] = (uint8_t)(r.value & 0xFF);
+    }
+    DEBUG_PRINTF(F("[ZIGBEE-GW] Queueing Tuya multi-DP frame -> short_addr=0x%04X ep=%d records=%u len=%u seq=%u\n"),
+                 short_addr, endpoint, (unsigned)n_recs, (unsigned)len, (unsigned)tuya_seq);
+    return gw_schedule_tuya_dp_cmd(short_addr, endpoint, TUYA_CMD_DATA_REQUEST,
+                                   recs[n_recs - 1].dp_id, recs[n_recs - 1].dp_type,
+                                   payload, len, tuya_seq, urgent);
 }
 
 static bool gw_send_tuya_dp_bool_write_cmd(uint64_t device_ieee, uint8_t endpoint, uint8_t dp_id, bool turnon,
-                                           uint8_t command_id, bool queue_on_unavailable) {
+                                           uint8_t command_id, bool urgent) {
     uint8_t bool_value[1] = { (uint8_t)(turnon ? 0x01 : 0x00) };
     return gw_send_tuya_dp_raw_cmd(device_ieee, endpoint, dp_id, TUYA_TYPE_BOOL,
-                                   bool_value, sizeof(bool_value), command_id,
-                                   queue_on_unavailable, turnon);
+                                   bool_value, sizeof(bool_value), command_id, urgent);
 }
 
 static bool gw_send_tuya_dp_value_write_cmd(uint64_t device_ieee, uint8_t endpoint, uint8_t dp_id, uint32_t value,
-                                            uint8_t command_id, bool queue_on_unavailable) {
+                                            uint8_t command_id, bool urgent) {
     uint8_t value_bytes[4] = {
         (uint8_t)(value >> 24),
         (uint8_t)(value >> 16),
@@ -5536,151 +6228,114 @@ static bool gw_send_tuya_dp_value_write_cmd(uint64_t device_ieee, uint8_t endpoi
         (uint8_t)(value & 0xFF) 
     };
     return gw_send_tuya_dp_raw_cmd(device_ieee, endpoint, dp_id, TUYA_TYPE_VALUE,
-                                   value_bytes, sizeof(value_bytes), command_id,
-                                   queue_on_unavailable, value != 0);
+                                   value_bytes, sizeof(value_bytes), command_id, urgent);
 }
 
-static bool gw_send_tuya_dp_enum_write_cmd(uint64_t device_ieee, uint8_t endpoint, uint8_t dp_id, uint8_t value,
-                                           uint8_t command_id, bool queue_on_unavailable) {
-    uint8_t value_byte[1] = { value };
-    return gw_send_tuya_dp_raw_cmd(device_ieee, endpoint, dp_id, TUYA_TYPE_ENUM,
-                                   value_byte, sizeof(value_byte), command_id,
-                                   queue_on_unavailable, value != 0);
+bool sensor_zigbee_send_tuya_dp_write(uint64_t device_ieee, uint8_t endpoint, uint8_t dp_id, bool turnon, bool urgent) {
+    return gw_send_tuya_dp_bool_write_cmd(device_ieee, endpoint, dp_id, turnon, TUYA_CMD_DATA_REQUEST, urgent);
 }
 
-bool sensor_zigbee_send_tuya_dp_write(uint64_t device_ieee, uint8_t endpoint, uint8_t dp_id, bool turnon) {
-    return gw_send_tuya_dp_bool_write_cmd(device_ieee, endpoint, dp_id, turnon, TUYA_CMD_DATA_REQUEST, false);
+bool sensor_zigbee_send_tuya_dp_value_write(uint64_t device_ieee, uint8_t endpoint, uint8_t dp_id, uint32_t value, bool urgent) {
+    return gw_send_tuya_dp_value_write_cmd(device_ieee, endpoint, dp_id, value, TUYA_CMD_DATA_REQUEST, urgent);
 }
 
-bool sensor_zigbee_send_tuya_dp_value_write(uint64_t device_ieee, uint8_t endpoint, uint8_t dp_id, uint32_t value) {
-    return gw_send_tuya_dp_value_write_cmd(device_ieee, endpoint, dp_id, value, TUYA_CMD_DATA_REQUEST, false);
-}
-
-bool sensor_zigbee_send_giex_water_valve_state_with_dur(uint64_t device_ieee, uint8_t endpoint, bool turnon, uint16_t dur, uint8_t dp_id) {
+// Resolve the state DP of a GIEX valve from its logical devices: dp_id 0/1
+// means "the first valve" (valve_1 / valve), otherwise the DP is used as is.
+static uint8_t gw_giex_resolve_state_dp(uint64_t device_ieee, uint8_t dp_id) {
+    if (dp_id != 0 && dp_id != 1) return dp_id;
     char ieee_str[17];
     snprintf(ieee_str, sizeof(ieee_str), "%016llX", (unsigned long long)device_ieee);
+    ZigBeeLogicalDevice* log_valve = OpenSprinkler::zigbee_logical_lookup(ieee_str, "valve_1");
+    if (!log_valve) log_valve = OpenSprinkler::zigbee_logical_lookup(ieee_str, "valve");
+    if (log_valve && log_valve->tuya_dp_value > 0) return (uint8_t)log_valve->tuya_dp_value;
+    return 2; // default for single-zone GIEX valves
+}
 
-    uint8_t active_dp = dp_id;
-    if (active_dp == 0 || active_dp == 1) {
-        ZigBeeLogicalDevice* log_valve = OpenSprinkler::zigbee_logical_lookup(ieee_str, "valve_1");
-        if (!log_valve) log_valve = OpenSprinkler::zigbee_logical_lookup(ieee_str, "valve");
-        if (log_valve) {
-            active_dp = log_valve->tuya_dp_value;
-        } else {
-            active_dp = 2; // Default fallback to DP 2 for single-zone valves
-        }
-    }
-
-    int valve_index = 0;
-    // Step 1: Detect valve index by searching logical devices with matching DP
-    for (int i = 1; i <= 8; i++) {
-        char valve_name[32];
-        snprintf(valve_name, sizeof(valve_name), "valve_%d", i);
-        ZigBeeLogicalDevice* log_valve = OpenSprinkler::zigbee_logical_lookup(ieee_str, valve_name);
-        if (log_valve && log_valve->tuya_dp_value == active_dp) {
-            valve_index = i;
-            break;
-        }
-    }
-    if (valve_index == 0) {
-        // Fallback check for "valve" (no index)
-        ZigBeeLogicalDevice* log_valve = OpenSprinkler::zigbee_logical_lookup(ieee_str, "valve");
-        if (log_valve && log_valve->tuya_dp_value == active_dp) {
-            valve_index = 1;
-        }
-    }
-    if (valve_index == 0) {
-        // Ultimate fallback based on common DP IDs if not registered in map
-        if (active_dp == 1) valve_index = 1;
-        else if (active_dp == 2) valve_index = 2;
-        else valve_index = 1;
-    }
-
-    // Step 2: Check support for different modes based on logical device names presence
-    ZigBeeLogicalDevice* log_valve_mode = OpenSprinkler::zigbee_logical_lookup(ieee_str, "valve_mode");
-    ZigBeeLogicalDevice* log_irrigation_target = OpenSprinkler::zigbee_logical_lookup(ieee_str, "irrigation_target");
-
-    // Let's look for countdown or timer for this specific valve_index
-    ZigBeeLogicalDevice* log_countdown = nullptr;
-    
-    // Construct names to search
-    char name_countdown_idx[32];
-    char name_timer_idx[32];
-    char name_countdown_l_idx[32];
-    
-    snprintf(name_countdown_idx, sizeof(name_countdown_idx), "countdown_%d", valve_index);
-    snprintf(name_timer_idx, sizeof(name_timer_idx), "timer_%d", valve_index);
-    snprintf(name_countdown_l_idx, sizeof(name_countdown_l_idx), "countdown_l%d", valve_index);
-    
-    log_countdown = OpenSprinkler::zigbee_logical_lookup(ieee_str, name_countdown_idx);
-    if (!log_countdown) log_countdown = OpenSprinkler::zigbee_logical_lookup(ieee_str, name_timer_idx);
-    if (!log_countdown) log_countdown = OpenSprinkler::zigbee_logical_lookup(ieee_str, name_countdown_l_idx);
-    
-    // Standard alternative names for index 1
-    if (!log_countdown && valve_index == 1) {
-        log_countdown = OpenSprinkler::zigbee_logical_lookup(ieee_str, "countdown_left");
-        if (!log_countdown) log_countdown = OpenSprinkler::zigbee_logical_lookup(ieee_str, "countdown");
-        if (!log_countdown) log_countdown = OpenSprinkler::zigbee_logical_lookup(ieee_str, "timer");
-    }
-
-    // Switch the valve ONLY. The secondary countdown / target DP writes are
-    // removed because sending multiple commands simultaneously overwhelms the
-    // sleepy end-device radio and triggers collision-misses. Active report
-    // verification and retry monitoring handle the safety tracking instead.
-    bool ok = gw_send_tuya_dp_bool_write_cmd(device_ieee, endpoint, active_dp, turnon, TUYA_CMD_DATA_REQUEST, false);
-    
-    return ok;
+bool sensor_zigbee_send_giex_water_valve_state_with_dur(uint64_t device_ieee, uint8_t endpoint, bool turnon, uint16_t dur, uint8_t dp_id, bool urgent) {
+    // The runtime (dur) is written by the station state machine, which knows
+    // the device's runtime DP from the DB template; this plain entry point
+    // only switches the valve.
+    (void)dur;
+    uint8_t active_dp = gw_giex_resolve_state_dp(device_ieee, dp_id);
+    return gw_send_tuya_dp_bool_write_cmd(device_ieee, endpoint, active_dp, turnon, TUYA_CMD_DATA_REQUEST, urgent);
 }
 
 bool sensor_zigbee_send_giex_water_valve_state(uint64_t device_ieee, uint8_t endpoint, bool turnon) {
-    return sensor_zigbee_send_giex_water_valve_state_with_dur(device_ieee, endpoint, turnon, 0, 0);
+    return sensor_zigbee_send_giex_water_valve_state_with_dur(device_ieee, endpoint, turnon, 0, 0, false);
 }
 
-void sensor_zigbee_station_verify_register(uint8_t sid, uint64_t ieee, uint8_t endpoint, uint8_t dp_id, bool expected_on, uint8_t ctrl_type) {
+void sensor_zigbee_station_command(uint8_t sid, uint64_t ieee, uint8_t endpoint, uint8_t dp_id, uint8_t verify_dp,
+                                   bool turnon, uint8_t ctrl_type, uint16_t dur,
+                                   const ZigbeeStationControlConfig* cfg) {
     if (sid >= MAX_NUM_STATIONS) return;
+    ZbStationCtl &e = zb_station_ctl[sid];
+    uint32_t now = millis();
+    e.dp_runtime   = cfg ? cfg->dp_runtime : 0;
+    e.runtime_unit = cfg ? cfg->runtime_unit : 0;
+    e.runtime_max  = cfg ? cfg->runtime_max : 0;
+    e.prereq_dp    = cfg ? cfg->prereq_dp : 0;
+    e.prereq_value = cfg ? cfg->prereq_value : 0;
 
-    // Optimistic display state; the incoming DP report will confirm or correct it.
-    zb_station_switch_error[sid] = 0;
-    zb_station_physical_on[sid]  = expected_on ? 1 : 0;
-
-    // Only Tuya/GIEX valves reliably echo their state via DP reports, so only
-    // those get an active verify-and-retry entry. Standard ZCL On/Off keeps the
-    // optimistic behaviour to avoid false switch-fail alerts on devices that do
-    // not report their on/off attribute.
-    if (ctrl_type == 0) return;
-
-    // Reuse an entry already pending for this station, else take a free slot.
-    int slot = -1;
-    for (int i = 0; i < ZB_VERIFY_MAX; i++) {
-        if (zb_verify_table[i].pending && zb_verify_table[i].sid == sid) { slot = i; break; }
-    }
-    if (slot < 0) {
-        for (int i = 0; i < ZB_VERIFY_MAX; i++) {
-            if (!zb_verify_table[i].pending) { slot = i; break; }
+    // A frame for this station may still be in flight inside the stack (no
+    // send status yet, up to ~60 s for a sleepy child).  Sending the new state
+    // now would put two commands into the indirect queue and the valve would
+    // receive both in a burst on its next poll.  Defer instead: the new state
+    // goes out as soon as the in-flight frame is acked, reported failed or
+    // timed out.  Nothing is lost by waiting: while the frame is pending the
+    // device has not polled, so it could not have taken the new command either.
+    bool in_flight = e.active && e.ieee == ieee && e.attempts > 0 && !e.delivered &&
+                     !e.last_send_failed && (now - e.last_sent_ms) < ZB_CTL_INFLIGHT_MAX_MS;
+    if (in_flight) {
+        e.desired_on = turnon;
+        e.dur        = dur;
+        e.requested_ms = now;
+        if (e.inflight_on == turnon) {
+            e.resend_needed = false;   // identical command already on its way
+        } else {
+            e.resend_needed = true;
+            e.next_try_ms  = now + 1000UL;
         }
+        DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u %s deferred: frame (on=%d) still in flight for %lums\n"),
+                     (unsigned)sid, turnon ? "ON" : "OFF", e.inflight_on ? 1 : 0,
+                     (unsigned long)(now - e.last_sent_ms));
+        return;
     }
-    if (slot < 0) slot = 0; // last resort: overwrite slot 0
 
-    zb_verify_table[slot].ieee        = ieee;
-    zb_verify_table[slot].dp_id       = dp_id;
-    zb_verify_table[slot].endpoint    = endpoint;
-    zb_verify_table[slot].expected_on = expected_on;
-    zb_verify_table[slot].sid         = sid;
-    zb_verify_table[slot].ctrl_type   = ctrl_type;
-    zb_verify_table[slot].sent_ms     = millis();
-    zb_verify_table[slot].retries     = 0;
-    zb_verify_table[slot].pending     = true;
+    // Latest command wins: an OFF always replaces a still-pending ON (and vice
+    // versa), so a command can never be lost behind an older one.
+    e.active        = true;
+    e.desired_on    = turnon;
+    e.ctrl_type     = ctrl_type;
+    e.endpoint      = endpoint ? endpoint : 1;
+    e.dp_id         = dp_id;
+    e.verify_dp     = verify_dp;
+    e.ieee          = ieee;
+    e.dur           = dur;
+    e.attempts      = 0;
+    e.send_fails    = 0;
+    e.have_tsn      = false;
+    e.delivered     = false;
+    e.last_send_failed = false;
+    e.resend_needed = false;
+    e.error_flagged = false;
+    e.requested_ms  = millis();
+    e.last_sent_ms  = 0;
+    e.next_try_ms   = millis();
+
+    // Status semantics for the UI (zst): 1 = command pending, 3/4 = state
+    // confirmed by the device (DP echo / APS ack), 2 = failed, 0 = idle.
+    // physical_on is therefore NOT set optimistically here; only
+    // gw_station_ctl_confirm() / a device report changes it.
+    zb_station_switch_error[sid] = 0;
+
+    gw_station_ctl_send(sid, false);
 }
 
 uint8_t sensor_zigbee_station_status_code(uint8_t sid) {
     if (sid >= MAX_NUM_STATIONS) return 0;
     if (zb_station_switch_error[sid]) return 2;
-    if (zb_station_switch_waiting[sid]) return zb_station_physical_on[sid] ? 4 : 1;
-
-    for (int i = 0; i < ZB_VERIFY_MAX; i++) {
-        if (zb_verify_table[i].pending && zb_verify_table[i].sid == sid) {
-            return zb_station_physical_on[sid] ? 4 : 1;
-        }
+    if (zb_station_switch_waiting[sid] || zb_station_ctl[sid].active) {
+        return zb_station_physical_on[sid] ? 4 : 1;
     }
     return zb_station_physical_on[sid] ? 3 : 0;
 }
@@ -5692,28 +6347,61 @@ void sensor_zigbee_station_clear_error(uint8_t sid) {
 
 void sensor_zigbee_station_verify_tick() {
     uint32_t now = millis();
-    for (int i = 0; i < ZB_VERIFY_MAX; i++) {
-        if (!zb_verify_table[i].pending) continue;
-        if ((uint32_t)(now - zb_verify_table[i].sent_ms) < ZB_VERIFY_RETRY_MS) continue;
-
-        if (zb_verify_table[i].retries < ZB_VERIFY_MAX_RETRIES) {
-            // No confirming report within the retry window — re-send the command.
-            DEBUG_PRINTF(F("[ZIGBEE-GW] Switch confirm timeout (no echo): sid=%u dp=%u expected_on=%d -> re-send\n"),
-                         (unsigned)zb_verify_table[i].sid,
-                         (unsigned)zb_verify_table[i].dp_id,
-                         zb_verify_table[i].expected_on ? 1 : 0);
-            gw_station_verify_resend(i);
-        } else {
-            DEBUG_PRINTF(F("[ZIGBEE-GW] Switch confirm failed after %u re-sends: sid=%u dp=%u expected_on=%d\n"),
-                         (unsigned)zb_verify_table[i].retries,
-                         (unsigned)zb_verify_table[i].sid,
-                         (unsigned)zb_verify_table[i].dp_id,
-                         zb_verify_table[i].expected_on ? 1 : 0);
-            gw_station_verify_publish_fail(zb_verify_table[i].sid,
-                                           zb_verify_table[i].expected_on, true);
-            zb_verify_table[i].pending = false;
+    for (uint8_t sid = 0; sid < MAX_NUM_STATIONS; sid++) {
+        ZbStationCtl &e = zb_station_ctl[sid];
+        if (!e.active) continue;
+        if (sid >= os.nstations || os.get_station_type(sid) != STN_TYPE_ZIGBEE || e.ieee == 0) {
+            e.active = false;  // stale / foreign entry: never act on it
+            continue;
         }
+        if ((int32_t)(now - e.next_try_ms) < 0) continue;
+
+        // Standard ZCL device on a stack that never reports send status:
+        // fall back to the former optimistic behaviour after a short grace.
+        if (e.ctrl_type == 0 && e.attempts > 0 && !gw_send_status_supported &&
+            (now - e.last_sent_ms) >= ZB_CTL_ZCL_LEGACY_CONFIRM_MS) {
+            gw_station_ctl_confirm(sid, "legacy/no send status");
+            continue;
+        }
+
+        // Alert once when nothing confirmed the switch within the timeout
+        // (measured from the request).  ON gives up; OFF keeps trying.
+        if (!e.error_flagged && (now - e.requested_ms) >= ZB_CTL_CONFIRM_TIMEOUT_MS) {
+            e.error_flagged = true;
+            DEBUG_PRINTF(F("[ZIGBEE-GW] Switch not confirmed within %lus: sid=%u dp=%u expected_on=%d sends=%u delivered=%d\n"),
+                         (unsigned long)(ZB_CTL_CONFIRM_TIMEOUT_MS / 1000UL), (unsigned)sid,
+                         (unsigned)e.verify_dp, e.desired_on ? 1 : 0, (unsigned)e.attempts, e.delivered ? 1 : 0);
+            gw_station_verify_publish_fail(sid, e.desired_on, true);
+            if (e.desired_on) {
+                e.active = false;
+                continue;
+            }
+        }
+
+        // One frame in flight at a time: re-send only after the stack reported
+        // the previous one as not delivered (or nothing was sent yet).
+        if (e.attempts > 0 && !e.last_send_failed) {
+            if (e.resend_needed && (now - e.last_sent_ms) >= ZB_CTL_INFLIGHT_MAX_MS) {
+                DEBUG_PRINTF(F("[ZIGBEE-GW] Station sid=%u in-flight frame timed out -> sending deferred %s\n"),
+                             (unsigned)sid, e.desired_on ? "ON" : "OFF");
+                gw_station_ctl_send(sid, false);
+                continue;
+            }
+            e.next_try_ms = now + 5000UL;  // re-evaluate timeout / wait for send status
+            continue;
+        }
+        if (e.attempts >= ZB_CTL_MAX_SENDS_TOTAL) {
+            e.next_try_ms = now + 60000UL; // cap reached: wake trigger only
+            continue;
+        }
+
+        gw_station_ctl_send(sid, false);
     }
+}
+
+void sensor_zigbee_gw_refresh_reporting(uint64_t ieee) {
+    if (ieee == 0 || !gw_zigbee_initialized) return;
+    gw_schedule_configure_reporting_for_ieee(ieee, 500UL);
 }
 
 void sensor_zigbee_gw_force_off_all_stations() {

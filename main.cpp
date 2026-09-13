@@ -101,7 +101,7 @@ extern "C" void mbedtls_spiram_allow_internal_reroute(bool enable);
 		#include <esp_flash.h>
 		#include <hal/spi_types.h>
 		#include <esp_flash_spi_init.h>
-		#include "OSPinger.h"
+		#include "Pinger.h"
 		Pinger *pinger = NULL;
 		WebServer *update_server = NULL;
 
@@ -117,7 +117,7 @@ extern "C" void mbedtls_spiram_allow_internal_reroute(bool enable);
 	#endif
 	unsigned long getNtpTime();
 #else // header and defs for RPI/Linux
-	#include "OSPinger.h"
+	#include "Pinger.h"
 	Pinger *pinger = NULL;
 	bool useEth = false;
 #endif
@@ -3484,118 +3484,7 @@ static void check_network() {
 		}
 	}
 #endif
-#if defined(ESP8266)
-	if (os.status.program_busy) {return;}
-
-	if (os.status.req_network) {
-		os.status.req_network = 0;
-		// change LCD icon to indicate it's checking network
-		if (!ui_state) {
-			os.lcd.setCursor(LCD_CURSOR_NETWORK, 1);
-			os.lcd.write('>');
-		}
-
-		if (!pinger) {
-			pinger = new Pinger();
-#if defined(ENABLE_DEBUG)
-			pinger->OnReceive([](const PingerResponse& response) {
-				if (response.ReceivedResponse) {
-					Serial.printf(
-						"Reply from %s: bytes=%d time=%ums TTL=%d\r\n",
-						response.DestIPAddress.toString().c_str(),
-						response.EchoMessageSize - sizeof(struct icmp_echo_hdr),
-						response.ResponseTime,
-						response.TimeToLive);
-				} else {
-					Serial.printf("Request timed out.\r\n");
-				}
-				return true;
-			});
-#endif
-
-			pinger->OnEnd([](const PingerResponse &response) {
-#if defined(ENABLE_DEBUG)
-				float loss = 100;
-				if(response.TotalReceivedResponses > 0) {
-					loss = (response.TotalSentRequests - response.TotalReceivedResponses) * 100 / response.TotalSentRequests;
-				}
-
-				Serial.printf("Ping statistics for %s:\r\n",
-					response.DestIPAddress.toString().c_str());
-				Serial.printf("    Packets: Sent = %u, Received = %u, Lost = %u (%.2f%% loss),\r\n",
-					response.TotalSentRequests,
-					response.TotalReceivedResponses,
-					response.TotalSentRequests - response.TotalReceivedResponses,
-					loss);
-
-				if(response.TotalReceivedResponses > 0) {
-					Serial.printf("Approximate round trip times in milli-seconds:\r\n");
-					Serial.printf("    Minimum = %ums, Maximum = %ums, Average = %.2fms\r\n",
-						response.MinResponseTime,
-						response.MaxResponseTime,
-						response.AvgResponseTime);
-				}
-
-				Serial.printf("Destination host data:\r\n");
-				Serial.printf("    IP address: %s\r\n",
-					response.DestIPAddress.toString().c_str());
-				if(response.DestMacAddress != nullptr) {
-					Serial.printf("    MAC address: " MACSTR "\r\n",
-						MAC2STR(response.DestMacAddress->addr));
-				}
-				if(response.DestHostname != "") {
-					Serial.printf("    DNS name: %s\r\n",
-						response.DestHostname.c_str());
-				}
-#endif
-				boolean failed = response.TotalSentRequests > response.TotalReceivedResponses;
-
-				ping_ok += response.TotalReceivedResponses;
-				if (!ping_ok)
-					return true;
-
-				if (failed) {
-					if(os.status.network_fails<3) os.status.network_fails++;
-				}
-				else os.status.network_fails=0;
-				if (os.status.network_fails==3) {
-					os.nvdata.reboot_cause = REBOOT_CAUSE_NETWORK_FAIL;
-					os.status.safe_reboot = 1;
-				}
-
-				return true;
-			});
-		}
-		if (useEth && (!eth.connected() || !eth.gatewayIP() || !eth.gatewayIP().isSet())) {
-			os.status.network_fails++;
-			return;
-		}
-		if (!useEth && (!WiFi.isConnected() || !WiFi.gatewayIP() || !WiFi.gatewayIP().isSet() || os.get_wifi_mode()==WIFI_MODE_AP)) {
-			os.status.network_fails++;
-			return;
-		}
-
-		boolean ping_ok = false;
-		switch(os.status.network_fails % 3) {
-			case 0:
-				ping_ok = pinger->Ping(useEth?eth.gatewayIP() : WiFi.gatewayIP());
-				break;
-			case 1:
-				ping_ok = pinger->Ping("google.com");
-				break;
-			case 2:
-				ping_ok = pinger->Ping("opensprinkler.com");
-				break;
-		}
-		if(!ping_ok) {
-			os.status.network_fails++;
-#if defined(ENABLE_DEBUG)
-			Serial.println("Error during last ping command.");
-#endif
-		}
-	}
-#endif
-#if defined(ESP32) || defined(OSPI) || defined(OSBO)
+#if defined(ESP8266) || defined(ESP32) || defined(OSPI) || defined(OSBO)
 	if (os.status.program_busy) {return;}
 
 	if (os.status.req_network) {
@@ -3674,7 +3563,11 @@ static void check_network() {
 					response.DestIPAddress.toString().c_str());
     			if(response.DestMacAddress != nullptr) {
       				Serial.printf("    MAC address: " MACSTR "\r\n",
+#if defined(ESP8266)
+        			MAC2STR(response.DestMacAddress->addr)); // esp8266-ping: struct eth_addr*
+#else
         			MAC2STR(response.DestMacAddress));
+#endif
     			}
     			if(response.DestHostname != "") {
       				Serial.printf("    DNS name: %s\r\n",
@@ -3876,20 +3769,6 @@ int main(int argc, char *argv[]) {
 #endif
 
 #if defined(ESP32)
-// https://esp32.com/viewtopic.php?t=30179
-// https://github.com/espressif/arduino-esp32/issues/8479
-size_t last_flash_used() {
-  esp_partition_iterator_t it;
-  size_t endpt = 0;
-  it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
-  for (; it != NULL; it = esp_partition_next(it)) {
-    const esp_partition_t *part = esp_partition_get(it);
-    endpt = part->address >= endpt ? part->address + part->size : endpt;
-  }
-  esp_partition_iterator_release(it);
-  return endpt;
-}
-
 void list_partitions() {
 		esp_partition_iterator_t _partition = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
 	DEBUG_PRINTLN(F("Partitions:"));

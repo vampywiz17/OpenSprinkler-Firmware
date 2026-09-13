@@ -446,12 +446,6 @@ void OSMqtt::init(void) {
 	init(id);
 }
 
-const char* getOnlineTopic() {
-	os.sopt_load(SOPT_DEVICE_NAME, tmp_buffer);
-	strncat(tmp_buffer, MQTT_AVAILABILITY_TOPIC, TMP_BUFFER_SIZE_L);
-	return tmp_buffer;
-}
-
 
 // Initialise the client libraries and event handlers.
 void OSMqtt::init(const char * clientId) {

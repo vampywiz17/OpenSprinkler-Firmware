@@ -59,6 +59,7 @@ extern "C" {
 #include "esp_zigbee_secur.h"
 #include "Zigbee.h"
 #include "ZigbeeEP.h"
+#include "sensor_zigbee_common.h"
 #include <esp_attr.h>
 
 // Optional: Restrict Zigbee to a single channel (e.g. 25 = 2475 MHz) to
@@ -119,76 +120,7 @@ struct ClientZigbeeNetworkSnapshot {
 #define TUYA_CMD_DATA_REQUEST   0x00
 #define TUYA_CMD_DATA_RESPONSE  0x01
 #define TUYA_CMD_DATA_REPORT    0x02
-#define TUYA_TYPE_RAW    0x00
-#define TUYA_TYPE_BOOL   0x01
-#define TUYA_TYPE_VALUE  0x02  // 4-byte big-endian integer
-#define TUYA_TYPE_STRING 0x03
-#define TUYA_TYPE_ENUM   0x04
-#define TUYA_TYPE_BITMAP 0x05
-// Flag to mark Tuya reports as pre-scaled (no ZCL scaling needed)
-#define TUYA_REPORT_FLAG_PRESCALED     0x8000
-#define TUYA_REPORT_TYPE_SHIFT         8
-#define TUYA_REPORT_TYPE_MASK          0x0F00
-#define TUYA_REPORT_DP_MASK            0x00FF
-
-static uint16_t tuya_report_attr(uint8_t dp_number, uint8_t dp_type) {
-    return TUYA_REPORT_FLAG_PRESCALED |
-           (((uint16_t)dp_type << TUYA_REPORT_TYPE_SHIFT) & TUYA_REPORT_TYPE_MASK) |
-           (uint16_t)dp_number;
-}
-
-static uint16_t zigbee_report_attr_id(uint16_t attr_id) {
-    return (attr_id & TUYA_REPORT_FLAG_PRESCALED) ? (attr_id & TUYA_REPORT_DP_MASK) : attr_id;
-}
-
-static uint8_t tuya_report_type(uint16_t attr_id) {
-    return (attr_id & TUYA_REPORT_FLAG_PRESCALED) ? (uint8_t)((attr_id & TUYA_REPORT_TYPE_MASK) >> TUYA_REPORT_TYPE_SHIFT) : 0;
-}
-
-static uint32_t zigbee_battery_percent_from_report(bool is_tuya_report, uint16_t raw_attr_id, uint8_t tuya_type, int16_t configured_tuya_battery_dp, int32_t value) {
-    if (is_tuya_report) {
-        // DP 14 is specifically "battery_state" (ENUM): 0=normal/full, 1=low
-        if (raw_attr_id == 14) {
-            if (value == 0) return 100;
-            return 15;
-        }
-
-        // DP 59 is GX03 battery (typically percentage 0-100 or enum/steps)
-        if (raw_attr_id == 59) {
-            if (value > 4 && value <= 100) return (uint32_t)value;
-            if (value == 4) return 100;
-            if (value == 3) return 75;
-            if (value == 2) return 50;
-            if (value == 1) return 25;
-            if (value == 0) return 100; // default to 100 on communicating device
-        }
-
-        if (raw_attr_id == 15 || raw_attr_id == 108 || raw_attr_id == 115 || raw_attr_id == 18 || 
-            (configured_tuya_battery_dp >= 0 && raw_attr_id == (uint16_t)configured_tuya_battery_dp)) {
-            
-            if (tuya_type == TUYA_TYPE_ENUM) {
-                // 3-state enum: 0=high/normal, 1=medium, 2=low
-                // OR 3-state: 0=low, 1=medium, 2=high.
-                if (value == 0) return 100;
-                if (value == 1) return 50;
-                if (value == 2 || value == 3) return 100;
-                return 100;
-            }
-
-            if (value <= 0) {
-                return 100; // active device with 0 is uninitialized or inverted full
-            }
-            return (value > 100) ? 100 : (uint32_t)value;
-        }
-
-        if (value < 0) return 0;
-        return (value > 100) ? 100 : (uint32_t)value;
-    }
-
-    if (value < 0) return 0;
-    uint32_t batt_pct = (uint32_t)(value / 2);
-    return (batt_pct > 100) ? 100 : batt_pct;
-}
+// TUYA_TYPE_* and TUYA_REPORT_* live in sensor_zigbee_common.h
 
 // Basic Cluster attribute IDs
 #define ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID       0x0004
@@ -266,38 +198,6 @@ static void client_queue_basic_cluster_query(uint64_t ieee_addr, uint16_t short_
 }
 
 /**
- * @brief Extract a ZCL CHAR_STRING attribute into a C string buffer
- * @param attr ZCL attribute (must be CHAR_STRING or LONG_CHAR_STRING type)
- * @param buf Output buffer
- * @param buf_size Size of output buffer
- * @return true if a string was extracted, false otherwise
- */
-static bool extractStringAttribute(const esp_zb_zcl_attribute_t *attr, char *buf, size_t buf_size) {
-    if (!attr || !attr->data.value || buf_size == 0) return false;
-    
-    if (attr->data.type == ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING) {
-        // ZCL CHAR_STRING: [length_byte][chars...] (NOT null-terminated)
-        uint8_t *raw = (uint8_t*)attr->data.value;
-        uint8_t len = raw[0];
-        if (len == 0xFF) { buf[0] = '\0'; return false; }  // 0xFF = invalid
-        if (len >= buf_size) len = buf_size - 1;
-        memcpy(buf, raw + 1, len);
-        buf[len] = '\0';
-        return len > 0;
-    } else if (attr->data.type == ESP_ZB_ZCL_ATTR_TYPE_LONG_CHAR_STRING) {
-        // ZCL LONG_CHAR_STRING: [length_u16_le][chars...]
-        uint8_t *raw = (uint8_t*)attr->data.value;
-        uint16_t len = raw[0] | ((uint16_t)raw[1] << 8);
-        if (len == 0xFFFF) { buf[0] = '\0'; return false; }
-        if (len >= buf_size) len = buf_size - 1;
-        memcpy(buf, raw + 2, len);
-        buf[len] = '\0';
-        return len > 0;
-    }
-    return false;
-}
-
-/**
  * @brief Handle Basic Cluster (0x0000) attribute read response in Client mode
  * Updates discovered device info and matching sensor configurations.
  */
@@ -305,7 +205,7 @@ static void client_handleBasicClusterResponse(uint16_t short_addr, const esp_zb_
     if (!attribute || !attribute->data.value) return;
     
     char str_buf[32] = {0};
-    if (!extractStringAttribute(attribute, str_buf, sizeof(str_buf))) {
+    if (!zigbee_extract_string_attribute(attribute, str_buf, sizeof(str_buf))) {
         // DEBUG_PRINTF(F("[ZIGBEE-CLIENT] Basic Cluster attr 0x%04X: not a string (type=0x%02X)\n"),
                      // attribute->id, attribute->data.type);
         return;
@@ -500,29 +400,7 @@ public:
     
 private:
     int32_t extractAttributeValue(const esp_zb_zcl_attribute_t *attr) {
-        if (!attr || !attr->data.value) return 0;
-        switch (attr->data.type) {
-            case ESP_ZB_ZCL_ATTR_TYPE_S8:  return (int32_t)(*(int8_t*)attr->data.value);
-            case ESP_ZB_ZCL_ATTR_TYPE_S16: return (int32_t)(*(int16_t*)attr->data.value);
-            case ESP_ZB_ZCL_ATTR_TYPE_S32: return *(int32_t*)attr->data.value;
-            case ESP_ZB_ZCL_ATTR_TYPE_U8:  return (int32_t)(*(uint8_t*)attr->data.value);
-            case ESP_ZB_ZCL_ATTR_TYPE_U16: return (int32_t)(*(uint16_t*)attr->data.value);
-            case ESP_ZB_ZCL_ATTR_TYPE_U32: return (int32_t)(*(uint32_t*)attr->data.value);
-            case 0x24:  // uint40
-            case 0x25: { // uint48
-                uint8_t len = (attr->data.type == 0x24) ? 5 : 6;
-                const uint8_t* raw = (const uint8_t*)attr->data.value;
-                uint32_t value = 0;
-                for (uint8_t i = 0; i < len && i < 4; i++) {
-                    value |= ((uint32_t)raw[i]) << (8 * i);
-                }
-                if (value > 0x7FFFFFFFUL) value = 0x7FFFFFFFUL;
-                return (int32_t)value;
-            }
-            default:
-                // DEBUG_PRINTF(F("[ZIGBEE-CLIENT] Unknown attribute type: 0x%02X\n"), attr->data.type);
-                return 0;
-        }
+        return zigbee_extract_attribute_value(attr);
     }
 };
 
@@ -945,7 +823,14 @@ static void client_zigbee_start_internal() {
     Zigbee.setTimeout(8000);
     DEBUG_PRINTLN(F("[ZIGBEE-CLIENT] Starting as END_DEVICE (ZCZR stack, joining external coordinator)"));
     DEBUG_PRINTF(F("[ZIGBEE-CLIENT] ZBOSS config: network_size=16, io_buffer=32, scheduler_queue=40\n"));
+    // Zigbee 3.0 commissioning: perform the trust-center link-key update after
+    // joining so the node does not keep using the well-known global key.
+    // -D ZIGBEE_ALLOW_WELLKNOWN_TCLK restores the legacy (insecure) behaviour.
+#if defined(ZIGBEE_ALLOW_WELLKNOWN_TCLK)
     esp_zb_secur_link_key_exchange_required_set(false);
+#else
+    esp_zb_secur_link_key_exchange_required_set(true);
+#endif
     DEBUG_PRINTLN(F("[ZIGBEE-CLIENT] Install code disabled; using normal Zigbee commissioning"));
     
     if (!Zigbee.begin(ZIGBEE_END_DEVICE, reset_zigbee_nvram)) {
@@ -1442,23 +1327,6 @@ bool sensor_zigbee_leave_network() {
     return client_erase_zigbee_nvram();
 }
 
-
-void sensor_zigbee_pause() {
-    IEEE802154Mode mode = ieee802154_get_mode();
-    if (mode == IEEE802154Mode::IEEE_ZIGBEE_GATEWAY || mode == IEEE802154Mode::IEEE_ZIGBEE_CLIENT) {
-        Zigbee.stop();
-        esp_ieee802154_sleep();
-    }
-}
-
-void sensor_zigbee_resume() {
-    IEEE802154Mode mode = ieee802154_get_mode();
-    if (mode == IEEE802154Mode::IEEE_ZIGBEE_GATEWAY || mode == IEEE802154Mode::IEEE_ZIGBEE_CLIENT) {
-        esp_ieee802154_receive();
-        Zigbee.start();
-    }
-}
-
 void sensor_zigbee_stop() {
     IEEE802154Mode mode = ieee802154_get_mode();
     if (mode == IEEE802154Mode::IEEE_ZIGBEE_GATEWAY) {
@@ -1772,7 +1640,7 @@ void ZigbeeSensor::zigbee_attribute_callback(uint64_t ieee_addr, uint8_t endpoin
             if ((cluster_id == ZB_ZCL_CLUSTER_ID_POWER_CONFIG && raw_attr_id == 0x0021) ||
                 (is_tuya_dp_report && zb_sensor->tuya_dp_battery >= 0 && raw_attr_id == (uint16_t)zb_sensor->tuya_dp_battery)) {
                 uint32_t batt_pct = zigbee_battery_percent_from_report(is_tuya_prescaled, raw_attr_id, tuya_type, zb_sensor->tuya_dp_battery, value);
-                zb_sensor->last_battery = batt_pct;
+                if (batt_pct != ZB_BATTERY_UNKNOWN) zb_sensor->last_battery = batt_pct;
                 zb_sensor->last_lqi = lqi;
                 DEBUG_PRINTF(F("[ZIGBEE-BATT] Sensor='%s' ieee=0x%016llX ep=%u raw=%ld -> batt=%u%% lqi=%u (no last_data overwrite)\n"),
                              sensor->getName(),
@@ -1894,7 +1762,7 @@ void ZigbeeSensor::zigbee_attribute_callback(uint64_t ieee_addr, uint8_t endpoin
                zb_sensor->device_ieee != 0 && zb_sensor->device_ieee == ieee_addr) {
             // Battery report for same device: update last_battery on non-battery sensors too
             uint32_t batt_pct = zigbee_battery_percent_from_report(is_tuya_prescaled, raw_attr_id, tuya_type, zb_sensor->tuya_dp_battery, value);
-            zb_sensor->last_battery = batt_pct;
+            if (batt_pct != ZB_BATTERY_UNKNOWN) zb_sensor->last_battery = batt_pct;
             DEBUG_PRINTF(F("[ZIGBEE-BATT] Linked sensor='%s' ieee=0x%016llX ep=%u raw=%ld -> batt=%u%% lqi=%u\n"),
                          sensor->getName(),
                          (unsigned long long)ieee_addr,
@@ -1937,6 +1805,44 @@ const char* ZigbeeSensor::getIeeeString(char* buffer, size_t bufferSize) const {
     if (bufferSize < 19) return "";
     snprintf(buffer, bufferSize, "0x%016llX", (unsigned long long)device_ieee);
     return buffer;
+}
+
+// Valve channel index from a logical device name ("valve_2" / "countdown_l2" -> 2, else 1).
+static uint8_t zb_channel_from_name(const char* name) {
+    if (!name) return 1;
+    size_t n = strlen(name);
+    size_t i = n;
+    while (i > 0 && isdigit((unsigned char)name[i - 1])) i--;
+    if (i == n || i == 0) return 1;
+    if (name[i - 1] != '_' && !(name[i - 1] == 'l' && i >= 2 && name[i - 2] == '_')) return 1;
+    int v = atoi(name + i);
+    return (v > 0 && v < 256) ? (uint8_t)v : 1;
+}
+
+// Attach the runtime DP of the same valve channel (device-DB role "runtime").
+static void zb_attach_runtime_config(ZigbeeStationControlConfig* config, const char* ieee_str, const ZigBeeLogicalDevice* control) {
+    if (!config || !control || !OpenSprinkler::zigbee_logical_devices_map) return;
+    uint8_t ch = control->channel ? control->channel : zb_channel_from_name(control->name);
+    const ZigBeeLogicalDevice* best = nullptr;
+    for (const auto& entry : *OpenSprinkler::zigbee_logical_devices_map) {
+        const ZigBeeLogicalDevice& dev = entry.second.device;
+        if (strncmp(dev.ieee, ieee_str, 16) != 0) continue;
+        if (dev.role != ZB_LD_ROLE_RUNTIME || dev.tuya_dp_value <= 0) continue;
+        uint8_t dch = dev.channel ? dev.channel : zb_channel_from_name(dev.name);
+        if (dch != ch) continue;
+        // Several DB rows may describe the same DP (e.g. countdown_1 and
+        // timer_1); the first one in map order wins, curate the DB to disambiguate.
+        if (!best) best = &dev;
+    }
+    if (!best) return;
+    config->dp_runtime   = (uint8_t)best->tuya_dp_value;
+    config->runtime_unit = best->runtime_unit;
+    config->runtime_max  = best->runtime_max;
+    config->prereq_dp    = (best->prereq_dp > 0 && best->prereq_dp < 256) ? (uint8_t)best->prereq_dp : 0;
+    config->prereq_value = best->prereq_value;
+    DEBUG_PRINTF(F("[ZIGBEE] Runtime channel for %s: dp=%u unit=%u max=%u prereq=%u=%d\n"),
+                 control->name, config->dp_runtime, config->runtime_unit, config->runtime_max,
+                 config->prereq_dp, (int)config->prereq_value);
 }
 
 bool sensor_zigbee_get_station_control_config(uint64_t device_ieee, ZigbeeStationControlConfig* config, uint8_t target_endpoint, uint8_t target_dp) {
@@ -1999,6 +1905,7 @@ bool sensor_zigbee_get_station_control_config(uint64_t device_ieee, ZigbeeStatio
             
             DEBUG_PRINTF(F("[ZIGBEE] Resolved station control config from logical device: %s (ep=%d dp_val=%d dp_stat=%d)\n"),
                          best_logdev->name, config->endpoint, config->dp_value, config->dp_status);
+            zb_attach_runtime_config(config, ieee_str, best_logdev);
             return true;
         }
     }
@@ -2402,6 +2309,29 @@ int ZigbeeSensor::read(unsigned long time) {
     // which sets data_ok=true. Trust passive reports - no forced active reads.
     // =========================================================================
     if (mode == IEEE802154Mode::IEEE_ZIGBEE_GATEWAY) {
+        // Silence watchdog for report-mode sensors: a device that once pushed
+        // reports may have lost its binding / reporting configuration (battery
+        // change, rejoin). data_ok stays true (last value keeps being served),
+        // so this check must run before the data_ok short-cut. After 3x the
+        // read interval (min 5 min) without a report, re-queue bind +
+        // configure-reporting and, for standard ZCL clusters, try an active
+        // read as fallback. Rate-limited to once per read interval.
+        if (comm_mode == ZB_COMM_REPORT && last_report_at_ms != 0 && device_ieee != 0) {
+            uint32_t intv = read_interval ? read_interval : 60;
+            unsigned long limit_ms = (unsigned long)intv * 3000UL;
+            if (limit_ms < 300000UL) limit_ms = 300000UL;
+            unsigned long silent_ms = millis() - last_report_at_ms;
+            if (silent_ms > limit_ms && time >= last_read + intv) {
+                last_read = time;
+                DEBUG_PRINTF(F("[ZB] Sensor #%d silent for %lus in REPORT mode -> refresh reporting + active read\n"),
+                             nr, silent_ms / 1000UL);
+                sensor_zigbee_gw_refresh_reporting(device_ieee);
+                if (cluster_id != ZB_ZCL_CLUSTER_ID_TUYA_SPECIFIC) {
+                    sensor_zigbee_gw_read_attribute(device_ieee, endpoint, cluster_id, attribute_id);
+                }
+            }
+        }
+
         if (flags.data_ok) {
             // Have valid report data — return it directly.
             // Do NOT consume data_ok here: the sensor should keep returning the

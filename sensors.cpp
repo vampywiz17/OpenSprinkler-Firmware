@@ -787,6 +787,12 @@ Monitor* monitor_iterate_next(MonitorIterator& it) {
  * @param nr
  */
 int sensor_delete(uint nr, bool save_now) {
+  // Thread-safety note: sensorsMap is only ever touched from the main loop
+  // (HTTP/MCP handlers, sensor_ble_loop(), the Zigbee report queue drain).
+  // The radio stacks (NimBLE task, Zigbee task) never dereference SensorBase
+  // objects directly; they queue reports that are consumed here. Keep it that
+  // way - do NOT call sensor_by_nr()/sensors_iterate_*() from a radio callback,
+  // or this delete would need a lock.
   auto it = sensorsMap.find(nr);
   if (it == sensorsMap.end()) return HTTP_RQT_NOT_RECEIVED;
   // Do not create a new driver object here; just remove the sensor
@@ -3356,6 +3362,57 @@ int monitor_delete(uint nr, bool save_now) {
   return HTTP_RQT_NOT_RECEIVED;
 }
 
+bool monitor_union_build(Monitor_Union_t &m, uint type, double value1, double value2,
+                         uint16_t sensor12, bool invers,
+                         uint16_t monitor1, uint16_t monitor2, uint16_t monitor3, uint16_t monitor4,
+                         bool invers1, bool invers2, bool invers3, bool invers4,
+                         uint16_t monitor, uint16_t time_from, uint16_t time_to, uint8_t weekdays,
+                         uint16_t rmonitor, uint32_t ip, uint16_t port) {
+  memset(&m, 0, sizeof(m));
+  switch (type) {
+    case MONITOR_MIN:
+    case MONITOR_MAX:
+      m.minmax.value1 = value1;
+      m.minmax.value2 = value2;
+      return true;
+    case MONITOR_SENSOR12:
+      m.sensor12.sensor12 = sensor12;
+      m.sensor12.invers = invers;
+      return true;
+    case MONITOR_SET_SENSOR12:
+      m.set_sensor12.monitor = monitor;
+      m.set_sensor12.sensor12 = sensor12;
+      return true;
+    case MONITOR_AND:
+    case MONITOR_OR:
+    case MONITOR_XOR:
+      m.andorxor.monitor1 = monitor1;
+      m.andorxor.monitor2 = monitor2;
+      m.andorxor.monitor3 = monitor3;
+      m.andorxor.monitor4 = monitor4;
+      m.andorxor.invers1 = invers1;
+      m.andorxor.invers2 = invers2;
+      m.andorxor.invers3 = invers3;
+      m.andorxor.invers4 = invers4;
+      return true;
+    case MONITOR_NOT:
+      m.mnot.monitor = monitor;
+      return true;
+    case MONITOR_TIME:
+      m.mtime.time_from = time_from;
+      m.mtime.time_to = time_to;
+      m.mtime.weekdays = weekdays;
+      return true;
+    case MONITOR_REMOTE:
+      m.remote.rmonitor = rmonitor;
+      m.remote.ip = ip;
+      m.remote.port = port;
+      return true;
+    default:
+      return false;
+  }
+}
+
 int monitor_define(uint nr, uint type, uint sensor, uint prog, uint zone, const Monitor_Union_t m, char * name, ulong maxRuntime, uint8_t prio, ulong reset_seconds, uint8_t output_mode, ulong stale_timeout, uint8_t failsafe_active, uint order, uint8_t show) {
   // Find or create monitor
   auto it = monitorsMap.find(nr);
@@ -3528,12 +3585,6 @@ void push_message(Monitor_t * mon, float value, int monidx) {
   DEBUG_PRINT(F(" - "));
   DEBUG_PRINTLN(type);
   notif.add(type, (uint32_t)mon->prio, value, (uint8_t)monidx);
-}
-
-bool get_monitor(uint nr, bool inv, bool defaultBool) {
-  Monitor_t *mon = monitor_by_nr(nr);
-  if (!mon) return defaultBool;
-  return inv ? !mon->active : mon->active;
 }
 
 bool get_remote_monitor(Monitor_t *mon, bool defaultBool) {
@@ -3934,20 +3985,6 @@ bool is_program_blocked_by_monitor(unsigned char pid) {
   return false;
 }
 
-char *strnlstr(const char *haystack, const char *needle, size_t needle_len, size_t len)
-{
-  int i;
-  for (i=0; i<=(int)(len-needle_len); i++)
-  {
-		if (haystack[0] == 0)
-			break;
-    if ((haystack[0] == needle[0]) &&
-        (strncmp(haystack, needle, needle_len) == 0))
-            return (char *)haystack;
-    haystack++;
-  }
-  return NULL;
-}
 
 static inline bool is_word_char(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';

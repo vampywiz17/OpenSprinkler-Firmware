@@ -510,11 +510,6 @@ uint32_t matter_get_init_time_ms() {
   return matter_init_time_ms;
 }
 
-// ====== Helper Functions ======
-inline int16_t celsius_to_matter(float c) { return (int16_t)(c * 100.0f); }
-inline uint16_t percent_to_matter(float p) { return (uint16_t)(p * 100.0f); }
-inline int16_t pressure_to_matter(float hPa) { return (int16_t)(hPa * 10.0f); }
-
 double matter_sensor_value_for_endpoint(const SensorBase *sensor, MatterSensorEndpoint endpoint) {
   if (!sensor) {
     return 0.0;

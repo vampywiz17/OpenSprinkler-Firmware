@@ -254,25 +254,6 @@ static unsigned char GPIOExport(int pin) {
 	return 1;
 }
 
-#if 0
-/** Unexport gpio pin */
-static unsigned char GPIOUnexport(int pin) {
-	char buffer[BUFFER_MAX];
-	int fd, len;
-
-	fd = open("/sys/class/gpio/unexport", O_WRONLY);
-	if (fd < 0) {
-		DEBUG_PRINTLN(F("failed to open unexport for writing"));
-		return 0;
-	}
-
-	len = snprintf(buffer, sizeof(buffer), "%d", pin);
-	write(fd, buffer, len);
-	close(fd);
-	return 1;
-}
-#endif
-
 /** Set interrupt edge mode */
 static unsigned char GPIOSetEdge(int pin, const char *edge) {
 	char path[BUFFER_MAX];

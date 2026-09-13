@@ -1,5 +1,5 @@
 /* Unified Pinger Implementation for ESP32 and Linux/OSPi
- * ESP8266 uses the esp8266-ping library (bluemurder) instead.
+ * ESP8266 uses the esp8266-ping library (bluemurder) instead (forwarded below).
  */
 
 // ESP8266 uses the esp8266-ping library (bluemurder) which provides its own

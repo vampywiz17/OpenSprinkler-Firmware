@@ -142,6 +142,12 @@ static uint64_t parse_ieee_hex(const char *hex16) {
  	strncpy(dev.unit, unit, sizeof(dev.unit) - 1);
  	dev.unit[sizeof(dev.unit) - 1] = '\0';
  	dev.unitid = obj.containsKey("unitid") ? obj["unitid"].as<uint8_t>() : 0U;
+	dev.role         = obj.containsKey("role")         ? obj["role"].as<uint8_t>()          : 0U;
+	dev.channel      = obj.containsKey("channel")      ? obj["channel"].as<uint8_t>()       : 0U;
+	dev.runtime_unit = obj.containsKey("runtime_unit") ? obj["runtime_unit"].as<uint8_t>()  : 0U;
+	dev.runtime_max  = obj.containsKey("runtime_max")  ? obj["runtime_max"].as<uint16_t>()  : 0U;
+	dev.prereq_dp    = obj.containsKey("prereq_dp")    ? obj["prereq_dp"].as<int16_t>()     : 0;
+	dev.prereq_value = obj.containsKey("prereq_value") ? obj["prereq_value"].as<int16_t>()  : 0;
  }
 
  static void add_logical_device_to_json(ArduinoJson::JsonArray arr, const ZigBeeLogicalDevice& dev) {
@@ -165,6 +171,16 @@ static uint64_t parse_ieee_hex(const char *hex16) {
  	obj["offset"] = dev.offset;
  	if (dev.unit[0] != '\0') obj["unit"] = dev.unit;
  	obj["unitid"] = dev.unitid;
+	if (dev.role) {
+		obj["role"] = dev.role;
+		obj["channel"] = dev.channel;
+		obj["runtime_unit"] = dev.runtime_unit;
+		obj["runtime_max"] = dev.runtime_max;
+		obj["prereq_dp"] = dev.prereq_dp;
+		obj["prereq_value"] = dev.prereq_value;
+	} else if (dev.channel) {
+		obj["channel"] = dev.channel;
+	}
  }
 #endif
 
@@ -386,7 +402,9 @@ void OpenSprinkler::switch_zigbeestation(ZigbeeStationData *data, bool turnon, u
 		             has_cfg ? 1 : 0,
 		             (unsigned)cfg.dp_value,
 		             (unsigned)cfg.dp_status);
+#if !(defined(ESP32C5) && defined(OS_ENABLE_ZIGBEE))
 		sensor_zigbee_send_giex_water_valve_state_with_dur(ieee, ep, turnon, dur, dp_id);
+#endif
 	} else if (use_tuya) {
 		DEBUG_PRINTF(F("[ZIGBEE] Station cmd sid=%u mode=TUYA ieee=%016llX ep=%u dp=%u turnon=%d has_cfg=%d cfg_dp_val=%u cfg_dp_stat=%u\n"),
 		             (unsigned)sid,
@@ -397,7 +415,9 @@ void OpenSprinkler::switch_zigbeestation(ZigbeeStationData *data, bool turnon, u
 		             has_cfg ? 1 : 0,
 		             (unsigned)cfg.dp_value,
 		             (unsigned)cfg.dp_status);
+#if !(defined(ESP32C5) && defined(OS_ENABLE_ZIGBEE))
 		sensor_zigbee_send_tuya_dp_write(ieee, ep, dp_id, turnon);
+#endif
 	} else {
 		DEBUG_PRINTF(F("[ZIGBEE] Station cmd sid=%u mode=STD ieee=%016llX ep=%u turnon=%d has_cfg=%d\n"),
 		             (unsigned)sid,
@@ -405,9 +425,13 @@ void OpenSprinkler::switch_zigbeestation(ZigbeeStationData *data, bool turnon, u
 		             (unsigned)ep,
 		             turnon ? 1 : 0,
 		             has_cfg ? 1 : 0);
+#if !(defined(ESP32C5) && defined(OS_ENABLE_ZIGBEE))
 		sensor_zigbee_send_on_off(ieee, ep, turnon);
+#endif
 	}
 	#if defined(ESP32C5) && defined(OS_ENABLE_ZIGBEE)
+	// The per-station state machine sends the command, retries with backoff,
+	// re-sends when the device wakes up and confirms via APS ack / DP echo.
 	uint8_t verify_dp = dp_id;
 	uint8_t ctrl_type = 0;
 	if (is_giex) {
@@ -443,7 +467,7 @@ void OpenSprinkler::switch_zigbeestation(ZigbeeStationData *data, bool turnon, u
 			verify_dp = cfg.dp_status;
 		}
 	}
-	sensor_zigbee_station_verify_register(sid, ieee, ep, verify_dp, turnon, ctrl_type);
+	sensor_zigbee_station_command(sid, ieee, ep, dp_id, verify_dp, turnon, ctrl_type, dur, has_cfg ? &cfg : nullptr);
 	#endif
 }
 

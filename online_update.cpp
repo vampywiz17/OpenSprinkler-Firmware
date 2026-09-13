@@ -1377,12 +1377,14 @@ bool ESP8266OTAUpdater::flashViaHttpClient(HTTPClient &http, size_t max_sketch_s
 		// Periodic progress heartbeat (every ~2s) with throughput + heap so a
 		// slow-down or WDT reset can be correlated against the last logged point.
 		if ((millis() - last_progress_log_ms) >= 2000) {
+#if defined(ENABLE_DEBUG)
 			uint32_t dt = millis() - last_progress_log_ms;
 			size_t delta = written - last_logged_written;
 			DEBUG_PRINTF("[OTA-ESP8266] Progress %u/%d (%u%%) %uB/s heap=%u elapsed=%lums\n",
 				(unsigned)written, content_length, (unsigned)_state.progress,
 				(unsigned)(dt ? (delta * 1000UL / dt) : 0), (unsigned)ESP.getFreeHeap(),
 				(unsigned long)(millis() - loop_start_ms));
+#endif
 			last_progress_log_ms = millis();
 			last_logged_written = written;
 		}

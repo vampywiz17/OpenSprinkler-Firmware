@@ -53,7 +53,7 @@ extern const char *user_agent_string;
 // stored raw (type + values) and rendered to text on demand at poll time to keep
 // the memory footprint tiny (important on ESP8266).
 // ---------------------------------------------------------------------------
-static NotifLogRecord notif_log[NOTIF_LOG_MAXSIZE];
+static PSRAM_BSS_ATTR NotifLogRecord notif_log[NOTIF_LOG_MAXSIZE];
 static uint8_t notif_log_head = 0;   // index of the oldest stored record
 static uint8_t notif_log_cnt = 0;    // number of stored records
 static uint32_t notif_log_nextid = 1;
@@ -226,13 +226,6 @@ uint32_t get_notif_enabled() {
 		((uint32_t)os.iopts[IOPT_NOTIF2_ENABLE] << 8) |
 		((uint32_t)os.iopts[IOPT_NOTIF3_ENABLE] << 16) |
 		((uint32_t)os.iopts[IOPT_NOTIF4_ENABLE] << 24);
-}
-
-void set_notif_enabled(uint32_t notif) {
-	os.iopts[IOPT_NOTIF_ENABLE] = notif&0xFF;
-	os.iopts[IOPT_NOTIF2_ENABLE] = (notif >> 8)&0xFF;
-	os.iopts[IOPT_NOTIF3_ENABLE] = (notif >> 16)&0xFF;
-	os.iopts[IOPT_NOTIF4_ENABLE] = (notif >> 24)&0xFF;
 }
 
 void ip2string(char* str, size_t str_len, unsigned char ip[4]) {
@@ -561,6 +554,90 @@ static void push_forward_event(uint32_t type, uint32_t lval, float fval, uint8_t
 }
 #endif
 
+
+#if defined(SUPPORT_EMAIL)
+#if defined(ESP8266) || defined(ESP32)
+typedef EMailSender::EMailMessage NotifierEmailMessage;
+#else
+struct NotifierEmailMessage {
+	String subject;
+	String message;
+};
+#endif
+
+/** Deliver one notification e-mail through the platform SMTP backend
+ *  (EMailSender/BearSSL on ESP8266/ESP32, libsmtp on Linux/OSPi).
+ *  Does nothing when host/login/password/recipient are incomplete. */
+static void notifier_send_email(NotifierEmailMessage &email_message, bool html_email_set,
+                                const String &email_host, int email_port,
+                                const String &email_login, const String &email_password,
+                                const String &email_username, const String &email_recipient) {
+	if(!(email_host.length()>0 && email_login.length()>0 && email_password.length()>0 && email_recipient.length()>0)) return; // incomplete config
+#if defined(ESP8266) || defined(ESP32)
+	// TLS handshake headroom required before opening the SMTP connection.
+	// ESP8266 (BearSSL, no PSRAM): needs ~8-10KB internal heap plus
+	// fragmentation headroom. Require 16000 so the 75% maxblock check
+	#if defined(ESP8266)
+		const size_t email_mem_needed = 16000;
+	#else
+		const size_t email_mem_needed = 10000;
+	#endif
+	bool mem_ok = free_tmp_memory(email_mem_needed);
+	#if defined(ESP32)
+		// ESP32 handles TLS memory gracefully (or uses PSRAM). We use free_tmp_memory
+		// to proactively suspend MQTT/Influx if internal heap is tight, but we
+		// don't hard-block the email attempt if the strict contiguous check fails.
+		mem_ok = true;
+	#endif
+	if (!mem_ok) {
+		// Not enough contiguous heap to open a TLS connection right now
+		// (typical during active watering on RAM-tight boards). Skip only
+		// the SMTP send; the caller still records the event in the in-memory
+		// notification log (/nl) and pushes it to InfluxDB.
+		DEBUG_PRINTLN(F("Not enough memory to send email (event still logged)"));
+		restore_tmp_memory(email_mem_needed);
+		return;
+	}
+	DEBUG_PRINTLN(F("Sending email..."));
+	EMailSender emailSend(email_login.c_str(), email_password.c_str(), email_username.c_str(), "OpenSprinkler");
+	emailSend.setSMTPServer(email_host.c_str());
+	emailSend.setSMTPPort(email_port);
+	// Use EHLO (ESMTP) instead of the library default HELO. AUTH is an
+	// ESMTP service extension that servers only advertise/enable after
+	// EHLO; some providers (e.g. GMX, Zoho) reject "AUTH LOGIN" issued
+	// after a plain HELO. The multi-line EHLO reply is parsed correctly
+	// (final line detected via the "250 " vs "250-" indicator).
+	emailSend.setEHLOCommand(true);
+	EMailSender::Response resp = emailSend.send(email_recipient.c_str(), email_message);
+	DEBUG_PRINTLN(F("Sending Status:"));
+	DEBUG_PRINTLN(resp.status);
+	DEBUG_PRINTLN(resp.code);
+	DEBUG_PRINTLN(resp.desc);
+	outbound_note_result(resp.status);
+	restore_tmp_memory(email_mem_needed);
+#elif !defined(ARDUINO)
+	struct smtp *smtp = NULL;
+	String email_port_str = to_string(email_port);
+	smtp_status_code rc;
+	rc = smtp_open(email_host.c_str(), email_port_str.c_str(), SMTP_SECURITY_TLS, SMTP_NO_CERT_VERIFY, NULL, &smtp);
+	rc = smtp_auth(smtp, SMTP_AUTH_PLAIN, email_login.c_str(), email_password.c_str());
+	rc = smtp_address_add(smtp, SMTP_ADDRESS_FROM, email_username.c_str(), "OpenSprinkler");
+	rc = smtp_address_add(smtp, SMTP_ADDRESS_TO, email_recipient.c_str(), "User");
+	rc = smtp_header_add(smtp, "Subject", email_message.subject.c_str());
+	if(html_email_set) {
+		rc = smtp_header_add(smtp, "Content-Type", "text/html; charset=UTF-8");
+	}
+	rc = smtp_mail(smtp, email_message.message.c_str());
+	rc = smtp_close(smtp);
+	outbound_note_result(rc == SMTP_STATUS_OK);
+	if (rc!=SMTP_STATUS_OK) {
+		DEBUG_PRINTF("SMTP: Error %s\n", smtp_status_code_errstr(rc));
+	}
+#else
+	(void)email_message; (void)html_email_set; (void)email_port;
+#endif
+}
+#endif // SUPPORT_EMAIL
 void push_message(uint32_t type, uint32_t lval, float fval, uint8_t bval) {
 	if (!is_notif_enabled(type)) {
 		return;
@@ -644,14 +721,7 @@ void push_message(uint32_t type, uint32_t lval, float fval, uint8_t bval) {
 #endif
 	#endif
 
-	#if defined(ESP8266) || defined(ESP32)
-		EMailSender::EMailMessage email_message;
-	#else
-		struct {
-			String subject;
-			String message;
-		} email_message;
-	#endif
+	NotifierEmailMessage email_message;
 
 	bool email_enabled = false;
 	bool html_email_set = false;
@@ -1301,77 +1371,10 @@ void push_message(uint32_t type, uint32_t lval, float fval, uint8_t bval) {
 				email_message.mime = "text/plain";
 			#endif
 		}
-		#if defined(ARDUINO)
-			#if defined(ESP8266) || defined(ESP32)
-				if(email_host.length()>0 && email_login.length()>0 && email_password.length()>0 && email_recipient.length()>0) { // make sure all are valid
-					// TLS handshake headroom required before opening the SMTP connection.
-					// ESP8266 (BearSSL, no PSRAM): needs ~8-10KB internal heap plus
-					// fragmentation headroom. Require 16000 so the 75% maxblock check
-					#if defined(ESP8266)
-						const size_t email_mem_needed = 16000;
-					#else
-						const size_t email_mem_needed = 10000;
-					#endif
-					bool mem_ok = free_tmp_memory(email_mem_needed);
-					#if defined(ESP32)
-						// ESP32 handles TLS memory gracefully (or uses PSRAM). We use free_tmp_memory 
-						// to proactively suspend MQTT/Influx if internal heap is tight, but we 
-						// don't hard-block the email attempt if the strict contiguous check fails.
-						mem_ok = true;
-					#endif
-
-					if (!mem_ok) {
-						// Not enough contiguous heap to open a TLS connection right now
-						// (typical during active watering on RAM-tight boards). Skip only
-						// the SMTP send — do NOT return, so this event is still recorded in
-						// the in-memory notification log (/nl) and pushed to InfluxDB below.
-						// Returning here used to make program-start/station-off events vanish
-						// entirely (no email, no app notification) whenever memory was tight.
-						DEBUG_PRINTLN(F("Not enough memory to send email (event still logged)"));
-						restore_tmp_memory(email_mem_needed);
-					} else {
-						DEBUG_PRINTLN(F("Sending email..."));
-						EMailSender emailSend(email_login.c_str(), email_password.c_str(), email_username.c_str(), "OpenSprinkler");
-						emailSend.setSMTPServer(email_host.c_str());
-						emailSend.setSMTPPort(email_port);
-						// Use EHLO (ESMTP) instead of the library default HELO. AUTH is an
-						// ESMTP service extension that servers only advertise/enable after
-						// EHLO; some providers (e.g. GMX, Zoho) reject "AUTH LOGIN" issued
-						// after a plain HELO. The multi-line EHLO reply is parsed correctly
-						// (final line detected via the "250 " vs "250-" indicator).
-						emailSend.setEHLOCommand(true);
-						EMailSender::Response resp = emailSend.send(email_recipient.c_str(), email_message);
-						DEBUG_PRINTLN(F("Sending Status:"));
-						DEBUG_PRINTLN(resp.status);
-						DEBUG_PRINTLN(resp.code);
-						DEBUG_PRINTLN(resp.desc);
-						outbound_note_result(resp.status);
-						restore_tmp_memory(email_mem_needed);
-					}
-				}
-			#endif
-		#else
-			struct smtp *smtp = NULL;
-			String email_port_str = to_string(email_port);
-			smtp_status_code rc;
-			if(email_host.length()>0 && email_login.length()>0 && email_password.length()>0 && email_recipient.length()>0) { // make sure all are valid
-				rc = smtp_open(email_host.c_str(), email_port_str.c_str(), SMTP_SECURITY_TLS, SMTP_NO_CERT_VERIFY, NULL, &smtp);
-				rc = smtp_auth(smtp, SMTP_AUTH_PLAIN, email_login.c_str(), email_password.c_str());
-				rc = smtp_address_add(smtp, SMTP_ADDRESS_FROM, email_username.c_str(), "OpenSprinkler");
-				rc = smtp_address_add(smtp, SMTP_ADDRESS_TO, email_recipient.c_str(), "User");
-				rc = smtp_header_add(smtp, "Subject", email_message.subject.c_str());
-				if(html_email_set) {
-					rc = smtp_header_add(smtp, "Content-Type", "text/html; charset=UTF-8");
-				}
-				rc = smtp_mail(smtp, email_message.message.c_str());
-				rc = smtp_close(smtp);
-				outbound_note_result(rc == SMTP_STATUS_OK);
-				if (rc!=SMTP_STATUS_OK) {
-					DEBUG_PRINTF("SMTP: Error %s\n", smtp_status_code_errstr(rc));
-				}
-			}
-		#endif
+		notifier_send_email(email_message, html_email_set, email_host, email_port,
+		                    email_login, email_password, email_username, email_recipient);
 	}
+
 	if (influxdb_enabled && !skip_online)
 		os.influxdb.push_message(type, lval, fval, sval);
 

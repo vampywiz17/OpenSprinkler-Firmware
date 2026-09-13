@@ -115,19 +115,6 @@ bool GardenaApi::authenticate(const String &auth) {
 #endif
 }
 
-static bool gardena_extract_location_id(JsonDocument &input, String &locationId) {
-	JsonObject obj = input.as<JsonObject>();
-	if (obj.containsKey("location_id")) {
-		locationId = obj["location_id"].as<String>();
-		return locationId.length() > 0;
-	}
-	if (obj.containsKey("locationId")) {
-		locationId = obj["locationId"].as<String>();
-		return locationId.length() > 0;
-	}
-	return false;
-}
-
 static bool gardena_fill_services(JsonDocument &raw, JsonDocument &out) {
 	JsonArrayConst included = raw["included"].as<JsonArrayConst>();
 	if (included.isNull()) {
